@@ -1,0 +1,20 @@
+AI SDR Dashboard — Team & Access Mock Mode
+
+1. Replace the deployed app.py with the app.py in this package.
+2. In Streamlit Community Cloud, open your app's Settings > Secrets.
+3. Add the content from secrets.toml.example, replacing the example Gmail address,
+   Google App Password, and dashboard URL with your own values.
+4. For Gmail SMTP, turn on 2-Step Verification and create a Google App Password.
+   Use that App Password, not your regular Gmail password.
+5. Save Secrets and allow the app to restart.
+6. Open Team & Access, select a campaign, enter the invitee's name and email,
+   choose View Only or Can Edit, and send the invitation.
+7. The recipient opens the email link and clicks Accept Invitation.
+8. Use Switch Mock User in the sidebar to preview the dashboard as that accepted user.
+
+Security note:
+- Invitation emails are real.
+- Mock user selection and campaign permissions are simulated, not secure authentication.
+- Do not use confidential company data until real authentication and shared database
+  access controls are implemented.
+- Never commit app passwords or other secrets to GitHub.

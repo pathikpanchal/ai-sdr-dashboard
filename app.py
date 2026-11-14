@@ -3,7 +3,13 @@ import pandas as pd
 import sqlite3
 import uuid
 import html
-from datetime import datetime
+import re
+import ssl
+import smtplib
+import secrets as pysecrets
+from email.message import EmailMessage
+from email.utils import formataddr
+from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_DIR = Path(__file__).parent
@@ -99,6 +105,36 @@ def get_connection():
             actor TEXT,
             details TEXT,
             created_at TEXT
+        )
+        """
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS team_members (
+            email TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS campaign_access (
+            id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            member_email TEXT NOT NULL,
+            member_name TEXT NOT NULL,
+            permission TEXT NOT NULL,
+            invitation_token TEXT,
+            invitation_status TEXT NOT NULL DEFAULT 'Pending',
+            invited_by TEXT NOT NULL DEFAULT 'Workspace Admin',
+            invited_at TEXT NOT NULL,
+            expires_at TEXT,
+            accepted_at TEXT,
+            revoked_at TEXT,
+            UNIQUE(campaign_id, member_email)
         )
         """
     )
@@ -668,8 +704,40 @@ REQUIREMENTS
 """
 
 
-def load_campaigns():
+def load_all_campaigns():
     return pd.read_sql_query("SELECT * FROM campaigns ORDER BY created_at DESC", conn)
+
+
+def load_campaigns():
+    """Show all campaigns to Workspace Admin and accepted shared campaigns to mock members."""
+    current_email = st.session_state.get("mock_user_email", "__admin__")
+    if current_email == "__admin__":
+        return load_all_campaigns()
+    return pd.read_sql_query(
+        """
+        SELECT c.*
+        FROM campaigns c
+        INNER JOIN campaign_access a ON a.campaign_id = c.id
+        WHERE a.member_email = ? AND a.invitation_status = 'Accepted'
+        ORDER BY c.created_at DESC
+        """,
+        conn,
+        params=(current_email,),
+    )
+
+
+def get_campaign_permission(campaign_id, user_email=None):
+    user_email = user_email or st.session_state.get("mock_user_email", "__admin__")
+    if user_email == "__admin__":
+        return "Owner"
+    row = conn.execute(
+        """
+        SELECT permission FROM campaign_access
+        WHERE campaign_id = ? AND member_email = ? AND invitation_status = 'Accepted'
+        """,
+        (campaign_id, user_email),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def campaign_label(campaign_id, campaigns):
@@ -741,7 +809,7 @@ def format_created_date(value):
 
 
 st.title("AI SDR Dashboard")
-st.caption("Phase I MVP · Mock Mode · No Clay API calls or Clay credits used")
+st.caption("Phase I MVP · Mock Mode · No Clay API calls or Clay credits used · Team invitations use configured email")
 
 NAV_ITEMS = [
     "Campaigns",
@@ -750,6 +818,19 @@ NAV_ITEMS = [
     "Activity Log",
     "Settings",
 ]
+
+if "pending_mock_user_email" in st.session_state:
+    st.session_state["mock_user_email"] = st.session_state.pop("pending_mock_user_email")
+
+active_mock_members = conn.execute(
+    "SELECT email, name FROM team_members WHERE status = 'Active' ORDER BY name"
+).fetchall()
+mock_user_labels = {"__admin__": "Workspace Admin"}
+for member_email, member_name in active_mock_members:
+    mock_user_labels[member_email] = f"{member_name} ({member_email})"
+
+if st.session_state.get("mock_user_email", "__admin__") not in mock_user_labels:
+    st.session_state["mock_user_email"] = "__admin__"
 
 with st.sidebar:
     st.markdown("## AI SDR Dashboard")
@@ -764,6 +845,30 @@ with st.sidebar:
     st.divider()
     st.success("MOCK MODE — ON")
     st.caption("Fictional sample data only. Clay is not connected.")
+    st.divider()
+    st.selectbox(
+        "Switch Mock User",
+        options=list(mock_user_labels.keys()),
+        format_func=lambda value: mock_user_labels.get(value, value),
+        key="mock_user_email",
+        help="Simulation only. This is not a secure login system.",
+    )
+    st.caption("Mock identity switcher — for testing only.")
+
+current_mock_user_email = st.session_state.get("mock_user_email", "__admin__")
+current_mock_user_name = mock_user_labels.get(current_mock_user_email, "Workspace Admin")
+is_mock_admin = current_mock_user_email == "__admin__"
+
+previous_mock_identity = st.session_state.get("_previous_mock_user_email", current_mock_user_email)
+if previous_mock_identity != current_mock_user_email:
+    for state_key in (
+        "pending_campaign_action",
+        "pending_campaign_action_id",
+        "editing_campaign_id",
+    ):
+        st.session_state.pop(state_key, None)
+    st.session_state["show_create_campaign_form"] = False
+    st.session_state["_previous_mock_user_email"] = current_mock_user_email
 
 # Show saved notices after navigation reruns.
 campaign_edit_notice = st.session_state.pop("campaign_edit_notice", None)
@@ -817,16 +922,191 @@ def log_activity(action, campaign_id=None, campaign_name="", actor="Unassigned",
     conn.commit()
 
 
+def get_invitation_email_config():
+    """Read SMTP settings from Streamlit Secrets; never store credentials in the app database."""
+    try:
+        config = dict(st.secrets.get("email", {}))
+    except Exception:
+        config = {}
+    return {
+        "smtp_server": config.get("smtp_server", "smtp.gmail.com"),
+        "smtp_port": int(config.get("smtp_port", 587)),
+        "sender_email": config.get("sender_email", "").strip(),
+        "app_password": config.get("app_password", "").replace(" ", "").strip(),
+        "sender_name": config.get("sender_name", "AI SDR Dashboard").strip(),
+        "dashboard_url": config.get("dashboard_url", "").strip().rstrip("/"),
+    }
+
+
+def invitation_email_is_configured():
+    config = get_invitation_email_config()
+    return bool(config["sender_email"] and config["app_password"] and config["dashboard_url"])
+
+
+def send_campaign_invitation_email(
+    recipient_name, recipient_email, campaign_name, permission, inviter_name, invitation_token
+):
+    """Send a real invitation email using Gmail SMTP or another configured SMTP server."""
+    config = get_invitation_email_config()
+    if not config["sender_email"] or not config["app_password"] or not config["dashboard_url"]:
+        raise ValueError(
+            "Email is not configured. Add sender_email, app_password, and dashboard_url "
+            "under [email] in Streamlit Secrets."
+        )
+
+    invitation_url = f"{config['dashboard_url']}?invite={invitation_token}"
+    safe_name = html.escape(recipient_name or "there")
+    safe_campaign = html.escape(campaign_name)
+    safe_permission = html.escape(permission)
+    safe_inviter = html.escape(inviter_name or "Workspace Admin")
+    safe_url = html.escape(invitation_url, quote=True)
+
+    message = EmailMessage()
+    message["Subject"] = f"You're invited to the AI SDR Dashboard — {campaign_name}"
+    message["From"] = formataddr((config["sender_name"], config["sender_email"]))
+    message["To"] = recipient_email
+    message.set_content(
+        f"Hi {recipient_name or 'there'},\n\n"
+        f"{inviter_name or 'Workspace Admin'} has invited you to access the AI SDR Dashboard.\n\n"
+        f"Campaign: {campaign_name}\nYour access: {permission}\n\n"
+        f"Accept your invitation using this link:\n{invitation_url}\n\n"
+        "This invitation link expires in 7 days.\n"
+        "If you were not expecting this invitation, you can ignore this email."
+    )
+    message.add_alternative(
+        f'<html><body style="font-family:Arial,sans-serif;color:#202938;line-height:1.55">'
+        f'<p>Hi {safe_name},</p>'
+        f'<p><strong>{safe_inviter}</strong> has invited you to access the AI SDR Dashboard.</p>'
+        f'<p><strong>Campaign:</strong> {safe_campaign}<br>'
+        f'<strong>Your access:</strong> {safe_permission}</p>'
+        f'<p><a href="{safe_url}" style="display:inline-block;background:#5b35d5;color:#fff;'
+        f'padding:11px 18px;text-decoration:none;border-radius:6px">Accept Invitation</a></p>'
+        f'<p>This invitation link expires in 7 days.</p>'
+        f'<p>If you were not expecting this invitation, you can ignore this email.</p>'
+        f'</body></html>',
+        subtype="html",
+    )
+
+    with smtplib.SMTP(config["smtp_server"], config["smtp_port"], timeout=25) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        server.login(config["sender_email"], config["app_password"])
+        server.send_message(message)
+
+
+def render_invitation_acceptance():
+    """Allow a mock invitee to accept a campaign invitation from the email link."""
+    try:
+        invitation_token = st.query_params.get("invite")
+    except Exception:
+        invitation_token = None
+    if not invitation_token:
+        return
+
+    invitation = conn.execute(
+        """
+        SELECT id, campaign_id, member_email, member_name, permission,
+               invitation_status, invited_by, expires_at
+        FROM campaign_access
+        WHERE invitation_token = ?
+        """,
+        (invitation_token,),
+    ).fetchone()
+
+    st.divider()
+    with st.container(border=True):
+        st.subheader("Campaign Invitation")
+        if not invitation:
+            st.error("This invitation link is invalid or has already been revoked.")
+            return
+
+        (
+            access_id, campaign_id, member_email, member_name, permission,
+            invitation_status, invited_by, expires_at,
+        ) = invitation
+
+        if invitation_status == "Accepted":
+            st.success("This invitation has already been accepted.")
+            return
+        if invitation_status != "Pending":
+            st.warning("This invitation is no longer active.")
+            return
+
+        try:
+            is_expired = bool(expires_at) and datetime.fromisoformat(expires_at) < datetime.now()
+        except ValueError:
+            is_expired = False
+        if is_expired:
+            conn.execute(
+                "UPDATE campaign_access SET invitation_status = 'Expired', invitation_token = NULL WHERE id = ?",
+                (access_id,),
+            )
+            conn.commit()
+            st.error("This invitation has expired. Ask the campaign owner to send a new one.")
+            return
+
+        campaign_row = conn.execute("SELECT name FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+        campaign_name = campaign_row[0] if campaign_row else "Campaign"
+        st.write(f"**Hello, {member_name}!**")
+        st.write(f"**Invited by:** {invited_by}")
+        st.write(f"**Campaign:** {campaign_name}")
+        st.write(f"**Permission:** {permission}")
+        st.caption(f"Invitation sent to {member_email}.")
+        st.warning(
+            "Mock Mode note: accepting activates the simulated user and campaign permission. "
+            "It does not verify identity or provide secure authentication."
+        )
+        if st.button("Accept Invitation", type="primary", key="accept_campaign_invitation"):
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                """
+                INSERT INTO team_members (email, name, status, created_at)
+                VALUES (?, ?, 'Active', ?)
+                ON CONFLICT(email) DO UPDATE SET name = excluded.name, status = 'Active'
+                """,
+                (member_email, member_name, now),
+            )
+            conn.execute(
+                """
+                UPDATE campaign_access
+                SET invitation_status = 'Accepted', accepted_at = ?
+                WHERE id = ?
+                """,
+                (now, access_id),
+            )
+            conn.commit()
+            log_activity(
+                "Campaign invitation accepted",
+                campaign_id,
+                campaign_name,
+                member_name,
+                f"{member_email} accepted {permission} access.",
+            )
+            st.session_state["pending_mock_user_email"] = member_email
+            try:
+                del st.query_params["invite"]
+            except Exception:
+                pass
+            st.success("Invitation accepted. You are now previewing the dashboard as this mock user.")
+            st.rerun()
+
+
+
+
+render_invitation_acceptance()
+
 if active_page == "Campaigns":
     heading_col, create_col = st.columns([5.5, 1.5])
     with heading_col:
         st.subheader("Campaign Overview")
         st.caption("Manage campaigns, review their criteria, and open the linked Clay table.")
     with create_col:
-        if st.button("＋ Create Campaign", type="primary", use_container_width=True):
-            st.session_state["show_create_campaign_form"] = True
-            st.session_state["editing_campaign_id"] = None
-            st.rerun()
+        if is_mock_admin:
+            if st.button("＋ Create Campaign", type="primary", use_container_width=True):
+                st.session_state["show_create_campaign_form"] = True
+                st.session_state["editing_campaign_id"] = None
+                st.rerun()
 
     delete_notice = st.session_state.pop("campaign_delete_notice", None)
     if delete_notice:
@@ -838,7 +1118,10 @@ if active_page == "Campaigns":
 
     campaigns = load_campaigns()
     if campaigns.empty:
-        st.info("No campaigns yet. Select **Create Campaign** to set up your first campaign.")
+        if is_mock_admin:
+            st.info("No campaigns yet. Select **Create Campaign** to set up your first campaign.")
+        else:
+            st.info("No campaigns have been shared with this mock user yet.")
         campaign_ids = []
     else:
         # Exact five-column campaign preview requested by the user.
@@ -916,21 +1199,27 @@ if active_page == "Campaigns":
         action_title, edit_col, duplicate_col, delete_col = st.columns([3.4, 1.3, 1.55, 1.3])
         with action_title:
             st.markdown(f"#### Selected Campaign: {selected_name}")
+        selected_permission = get_campaign_permission(selected_id)
         with edit_col:
-            if st.button("Edit Campaign", key="selected_edit_campaign", use_container_width=True):
-                st.session_state["pending_campaign_action"] = "edit"
-                st.session_state["pending_campaign_action_id"] = selected_id
-                st.rerun()
+            if selected_permission in ("Owner", "Can Edit"):
+                if st.button("Edit Campaign", key="selected_edit_campaign", use_container_width=True):
+                    st.session_state["pending_campaign_action"] = "edit"
+                    st.session_state["pending_campaign_action_id"] = selected_id
+                    st.rerun()
+            else:
+                st.caption("View Only")
         with duplicate_col:
-            if st.button("Duplicate Campaign", key="selected_duplicate_campaign", use_container_width=True):
-                st.session_state["pending_campaign_action"] = "duplicate"
-                st.session_state["pending_campaign_action_id"] = selected_id
-                st.rerun()
+            if selected_permission in ("Owner", "Can Edit"):
+                if st.button("Duplicate Campaign", key="selected_duplicate_campaign", use_container_width=True):
+                    st.session_state["pending_campaign_action"] = "duplicate"
+                    st.session_state["pending_campaign_action_id"] = selected_id
+                    st.rerun()
         with delete_col:
-            if st.button("Delete Campaign", key="selected_delete_campaign", use_container_width=True):
-                st.session_state["pending_campaign_action"] = "delete"
-                st.session_state["pending_campaign_action_id"] = selected_id
-                st.rerun()
+            if selected_permission == "Owner":
+                if st.button("Delete Campaign", key="selected_delete_campaign", use_container_width=True):
+                    st.session_state["pending_campaign_action"] = "delete"
+                    st.session_state["pending_campaign_action_id"] = selected_id
+                    st.rerun()
 
         detail_cols = st.columns([1.25, 2.75])
         with detail_cols[0]:
@@ -1001,6 +1290,7 @@ if active_page == "Campaigns":
                         elif pending_action == "duplicate":
                             new_id = str(uuid.uuid4())
                             new_name = selected_name + " (Copy)"
+                            duplicate_owner = selected_owner if is_mock_admin else current_mock_user_name
                             conn.execute(
                                 """
                                 INSERT INTO campaigns
@@ -1025,15 +1315,27 @@ if active_page == "Campaigns":
                                     selected_row.get("job_level", "Above") or "Above",
                                     selected_row.get("email_sequence_instructions", "") or "",
                                     "",  # A duplicate starts without the original Clay table URL.
-                                    selected_owner,
+                                    duplicate_owner,
                                 ),
                             )
+                            if not is_mock_admin:
+                                conn.execute(
+                                    "INSERT INTO campaign_access "
+                                    "(id, campaign_id, member_email, member_name, permission, "
+                                    "invitation_token, invitation_status, invited_by, invited_at, expires_at) "
+                                    "VALUES (?, ?, ?, ?, ?, NULL, 'Accepted', ?, ?, NULL)",
+                                    (
+                                        str(uuid.uuid4()), new_id, current_mock_user_email,
+                                        current_mock_user_name, "Can Edit", current_mock_user_name,
+                                        datetime.now().isoformat(timespec="seconds"),
+                                    ),
+                                )
                             conn.commit()
                             log_activity(
                                 "Campaign duplicated",
                                 new_id,
                                 new_name,
-                                selected_owner,
+                                duplicate_owner,
                                 f"Duplicated from campaign: {selected_name}",
                             )
                             st.session_state["overview_campaign"] = new_id
@@ -1072,7 +1374,7 @@ if active_page == "Campaigns":
                         st.rerun()
 
         # The same criteria editor is used for normal edits and newly duplicated campaigns.
-        if st.session_state.get("editing_campaign_id") == selected_id:
+        if st.session_state.get("editing_campaign_id") == selected_id and selected_permission in ("Owner", "Can Edit"):
             st.markdown("#### Edit Campaign Criteria")
             st.caption(
                 "Update the criteria for this campaign. A duplicated campaign is independent "
@@ -1251,7 +1553,7 @@ if active_page == "Campaigns":
                 st.rerun()
 
     # Campaign creation is opened from the Create Campaign button above.
-    if st.session_state.get("show_create_campaign_form"):
+    if is_mock_admin and st.session_state.get("show_create_campaign_form"):
         st.divider()
         with st.container(border=True):
             create_title_col, create_cancel_col = st.columns([5, 1])
@@ -1355,12 +1657,20 @@ if active_page == "Campaigns":
     # Keep the mock research runner available without a separate navigation tab.
     campaigns_for_run = load_campaigns()
     if not campaigns_for_run.empty:
+        campaigns_for_run = campaigns_for_run[
+            campaigns_for_run["id"].apply(
+                lambda campaign_id: get_campaign_permission(campaign_id) in ("Owner", "Can Edit")
+            )
+        ]
+    if not campaigns_for_run.empty:
         with st.expander("Run Mock Research", expanded=False):
             st.caption(
                 "This runs against fictional sample records only. It does not connect to Clay "
                 "or consume Clay credits."
             )
             run_ids = campaigns_for_run["id"].tolist()
+            if st.session_state.get("run_campaign_selector") not in run_ids:
+                st.session_state["run_campaign_selector"] = run_ids[0]
             active_default = st.session_state.get("active_campaign_id")
             default_index = run_ids.index(active_default) if active_default in run_ids else 0
             run_campaign_id = st.selectbox(
@@ -1396,14 +1706,23 @@ elif active_page == "Review & Approvals":
     st.caption("Review the sample contacts and email drafts associated with each campaign.")
     campaigns = load_campaigns()
     if campaigns.empty:
-        st.info("Create a campaign and run Mock Research first.")
+        if is_mock_admin:
+            st.info("Create a campaign and run Mock Research first.")
+        else:
+            st.info("No campaigns have been shared with this mock user.")
     else:
+        if st.session_state.get("lead_campaign_selector") not in campaigns["id"].tolist():
+            st.session_state["lead_campaign_selector"] = campaigns.iloc[0]["id"]
         selected_campaign_id = st.selectbox(
             "Campaign",
             campaigns["id"].tolist(),
             format_func=lambda item: campaign_label(item, campaigns),
             key="lead_campaign_selector",
         )
+        selected_review_permission = get_campaign_permission(selected_campaign_id)
+        can_edit_review = selected_review_permission in ("Owner", "Can Edit")
+        if not can_edit_review:
+            st.info("You have View Only access. You can review drafts but cannot change or approve them.")
         leads = pd.read_sql_query(
             "SELECT * FROM leads WHERE campaign_id = ?",
             conn,
@@ -1490,7 +1809,7 @@ elif active_page == "Review & Approvals":
                         value=str(row[f"email{sequence_number}_body"] or ""),
                         height=120,
                     )
-                save_drafts = st.form_submit_button("Save Email Drafts")
+                save_drafts = st.form_submit_button("Save Email Drafts", disabled=not can_edit_review)
             if save_drafts:
                 conn.execute(
                     """
@@ -1515,7 +1834,7 @@ elif active_page == "Review & Approvals":
                 )
                 st.success("Email drafts saved. No email has been sent.")
 
-            if st.button("Approve Contact for Campaign Review", key=f"approve_{contact_id}"):
+            if st.button("Approve Contact for Campaign Review", key=f"approve_{contact_id}", disabled=not can_edit_review):
                 conn.execute(
                     "UPDATE leads SET review_status = ? WHERE id = ?",
                     ("Approved for campaign review", contact_id),
@@ -1537,24 +1856,281 @@ elif active_page == "Review & Approvals":
 
 elif active_page == "Team & Access":
     st.subheader("Team & Access")
-    st.caption("Campaign-level sharing and individual permissions")
-    st.info(
-        "The sharing workflow is planned, but secure multi-user access is not active in this Mock Mode build."
-    )
-    st.markdown("#### Planned sharing controls")
-    st.write(
-        "Campaign owners will be able to select individual teammates and explicitly assign "
-        "**View Only** or **Can Edit** access to each person. No permission will be selected by default."
-    )
-    st.write(
-        "Owners will also be able to change a teammate's permission or revoke access from a "
-        "Manage Access view. Different teammates can have different permissions for the same campaign."
+    st.caption("Invite teammates, assign campaign permissions, and test access in Mock Mode.")
+
+    if invitation_email_is_configured():
+        st.success("Invitation email is configured. Invitations will be sent as real emails.")
+    else:
+        st.warning("Gmail is not configured yet. Add the email settings in Streamlit Secrets before sending invitations.")
+
+    with st.expander("Gmail setup for testing", expanded=not invitation_email_is_configured()):
+        st.write(
+            "Use a Gmail account with 2-Step Verification enabled and a Google App Password. "
+            "Do not use your normal Gmail password."
+        )
+        st.code(
+            "[email]\nsmtp_server = \"smtp.gmail.com\"\nsmtp_port = 587\n"
+            "sender_email = \"your.test.account@gmail.com\"\n"
+            "app_password = \"your-16-character-google-app-password\"\n"
+            "sender_name = \"AI SDR Dashboard\"\n"
+            "dashboard_url = \"https://your-app-name.streamlit.app\"",
+            language="toml",
+        )
+        st.caption(
+            "Add this under your Streamlit app's Settings → Secrets. Keep the app password private "
+            "and never commit it to GitHub."
+        )
+        st.markdown("[Google instructions: create an App Password](https://support.google.com/mail/answer/185833)")
+
+    if is_mock_admin:
+        st.markdown("### Invite a teammate")
+        all_campaigns_for_sharing = load_all_campaigns()
+        if all_campaigns_for_sharing.empty:
+            st.info("Create a campaign first, then you can invite someone to access it.")
+        else:
+            with st.form("send_campaign_invitation_form"):
+                invite_campaign_id = st.selectbox(
+                    "Campaign to share",
+                    all_campaigns_for_sharing["id"].tolist(),
+                    format_func=lambda item: campaign_label(item, all_campaigns_for_sharing),
+                )
+                invite_name = st.text_input("User name")
+                invite_email = st.text_input("User email address")
+                invite_permission = st.selectbox(
+                    "Access permission",
+                    ["View Only", "Can Edit"],
+                    index=None,
+                    placeholder="Select permission",
+                    help="You must choose a permission. Nothing is selected by default.",
+                )
+                send_invitation = st.form_submit_button("Send Invitation", type="primary")
+
+            if send_invitation:
+                email_value = invite_email.strip().lower()
+                campaign_row = all_campaigns_for_sharing[
+                    all_campaigns_for_sharing["id"] == invite_campaign_id
+                ].iloc[0]
+                campaign_name = str(campaign_row["name"] or "Campaign")
+                if not invite_name.strip():
+                    st.error("Please enter the user's name.")
+                elif not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email_value):
+                    st.error("Please enter a valid email address.")
+                elif not invite_permission:
+                    st.error("Please select View Only or Can Edit.")
+                elif not invitation_email_is_configured():
+                    st.error("Configure Gmail in Streamlit Secrets before sending invitations.")
+                else:
+                    invitation_token = pysecrets.token_urlsafe(32)
+                    now = datetime.now()
+                    now_text = now.isoformat(timespec="seconds")
+                    expiry_text = (now + timedelta(days=7)).isoformat(timespec="seconds")
+                    inviter_name = current_mock_user_name
+
+                    conn.execute(
+                        """
+                        INSERT INTO team_members (email, name, status, created_at)
+                        VALUES (?, ?, 'Pending', ?)
+                        ON CONFLICT(email) DO UPDATE SET name = excluded.name
+                        """,
+                        (email_value, invite_name.strip(), now_text),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO campaign_access
+                        (id, campaign_id, member_email, member_name, permission, invitation_token,
+                         invitation_status, invited_by, invited_at, expires_at, accepted_at, revoked_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?, ?, ?, NULL, NULL)
+                        ON CONFLICT(campaign_id, member_email) DO UPDATE SET
+                            member_name = excluded.member_name,
+                            permission = excluded.permission,
+                            invitation_token = excluded.invitation_token,
+                            invitation_status = 'Pending',
+                            invited_by = excluded.invited_by,
+                            invited_at = excluded.invited_at,
+                            expires_at = excluded.expires_at,
+                            accepted_at = NULL,
+                            revoked_at = NULL
+                        """,
+                        (
+                            str(uuid.uuid4()), invite_campaign_id, email_value, invite_name.strip(),
+                            invite_permission, invitation_token, inviter_name, now_text, expiry_text,
+                        ),
+                    )
+                    conn.commit()
+                    try:
+                        send_campaign_invitation_email(
+                            invite_name.strip(), email_value, campaign_name,
+                            invite_permission, inviter_name, invitation_token,
+                        )
+                        log_activity(
+                            "Campaign invitation sent",
+                            invite_campaign_id,
+                            campaign_name,
+                            inviter_name,
+                            f"Invitation sent to {email_value} with {invite_permission} permission.",
+                        )
+                        st.success(f"Invitation email sent to {email_value}.")
+                    except Exception as exc:
+                        conn.execute(
+                            """
+                            UPDATE campaign_access
+                            SET invitation_status = 'Email Failed', invitation_token = NULL
+                            WHERE campaign_id = ? AND member_email = ?
+                            """,
+                            (invite_campaign_id, email_value),
+                        )
+                        conn.commit()
+                        st.error(f"Could not send the invitation email: {exc}")
+
+        st.markdown("### Manage Campaign Access")
+        all_campaigns_for_sharing = load_all_campaigns()
+        if not all_campaigns_for_sharing.empty:
+            manage_campaign_id = st.selectbox(
+                "Choose campaign",
+                all_campaigns_for_sharing["id"].tolist(),
+                format_func=lambda item: campaign_label(item, all_campaigns_for_sharing),
+                key="manage_access_campaign",
+            )
+            access_rows = conn.execute(
+                """
+                SELECT id, member_name, member_email, permission, invitation_status,
+                       invited_at, accepted_at
+                FROM campaign_access
+                WHERE campaign_id = ?
+                ORDER BY invited_at DESC
+                """,
+                (manage_campaign_id,),
+            ).fetchall()
+
+            if not access_rows:
+                st.info("No one has been invited to this campaign yet.")
+            else:
+                for access_row in access_rows:
+                    (
+                        access_id, member_name, member_email, current_permission,
+                        invitation_status, invited_at, accepted_at,
+                    ) = access_row
+                    with st.container(border=True):
+                        member_cols = st.columns([1.5, 2.1, 1.25, 1.4, 1.0])
+                        member_cols[0].write(f"**{member_name}**")
+                        member_cols[1].write(member_email)
+                        member_cols[2].write(invitation_status)
+                        with member_cols[3]:
+                            new_permission = st.selectbox(
+                                "Permission",
+                                ["View Only", "Can Edit"],
+                                index=["View Only", "Can Edit"].index(current_permission),
+                                key=f"access_permission_{access_id}",
+                                label_visibility="collapsed",
+                            )
+                        with member_cols[4]:
+                            if st.button("Save", key=f"save_access_{access_id}"):
+                                conn.execute(
+                                    "UPDATE campaign_access SET permission = ? WHERE id = ?",
+                                    (new_permission, access_id),
+                                )
+                                conn.commit()
+                                if invitation_status == "Pending":
+                                    latest = conn.execute(
+                                        """
+                                        SELECT invitation_token, member_name, member_email, invited_by
+                                        FROM campaign_access WHERE id = ?
+                                        """,
+                                        (access_id,),
+                                    ).fetchone()
+                                    try:
+                                        send_campaign_invitation_email(
+                                            latest[1], latest[2],
+                                            campaign_label(manage_campaign_id, all_campaigns_for_sharing),
+                                            new_permission, latest[3], latest[0],
+                                        )
+                                        st.success("Permission updated and revised invitation email sent.")
+                                    except Exception as exc:
+                                        st.error(f"Permission updated, but revised email could not be sent: {exc}")
+                                else:
+                                    st.success("Permission updated.")
+                                st.rerun()
+
+                        revoke_col, info_col = st.columns([1, 4])
+                        with revoke_col:
+                            if invitation_status != "Revoked":
+                                if st.button("Revoke Access", key=f"revoke_access_{access_id}"):
+                                    conn.execute(
+                                        """
+                                        UPDATE campaign_access
+                                        SET invitation_status = 'Revoked',
+                                            invitation_token = NULL,
+                                            revoked_at = ?
+                                        WHERE id = ?
+                                        """,
+                                        (datetime.now().isoformat(timespec="seconds"), access_id),
+                                    )
+                                    remaining_active = conn.execute(
+                                        """
+                                        SELECT COUNT(*) FROM campaign_access
+                                        WHERE member_email = ? AND invitation_status = 'Accepted'
+                                        """,
+                                        (member_email,),
+                                    ).fetchone()[0]
+                                    if not remaining_active:
+                                        conn.execute(
+                                            "UPDATE team_members SET status = 'Inactive' WHERE email = ?",
+                                            (member_email,),
+                                        )
+                                    conn.commit()
+                                    log_activity(
+                                        "Campaign access revoked",
+                                        manage_campaign_id,
+                                        campaign_label(manage_campaign_id, all_campaigns_for_sharing),
+                                        current_mock_user_name,
+                                        f"Revoked access for {member_email}.",
+                                    )
+                                    st.success(f"Access revoked for {member_email}.")
+                                    st.rerun()
+                        with info_col:
+                            st.caption(
+                                f"Invited: {format_created_date(invited_at)}"
+                                + (f" · Accepted: {format_created_date(accepted_at)}" if accepted_at else "")
+                            )
+
+    else:
+        st.markdown("### Your Shared Campaigns")
+        shared_rows = conn.execute(
+            """
+            SELECT c.name, a.permission, a.invitation_status, a.invited_by, a.invited_at
+            FROM campaign_access a
+            JOIN campaigns c ON c.id = a.campaign_id
+            WHERE a.member_email = ?
+            ORDER BY a.invited_at DESC
+            """,
+            (current_mock_user_email,),
+        ).fetchall()
+        if shared_rows:
+            st.dataframe(
+                pd.DataFrame(
+                    shared_rows,
+                    columns=["Campaign", "Permission", "Invitation Status", "Invited By", "Invited Date"],
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No campaign access has been assigned to this mock user.")
+        st.caption("Only Workspace Admin can send invitations, change permissions, or revoke access.")
+
+    st.markdown("### Mock Access Testing")
+    st.write(f"**Current mock identity:** {current_mock_user_name}")
+    st.caption(
+        "Use Switch Mock User in the sidebar to preview the dashboard as an accepted invitee. "
+        "View Only users can open shared campaigns but cannot edit drafts or campaign criteria; "
+        "Can Edit users can edit and duplicate campaigns. Only Workspace Admin can delete campaigns."
     )
     st.warning(
-        "This deployment currently uses a local SQLite database and does not enforce individual user logins "
-        "or campaign-level access restrictions. Do not treat the current app as a secure multi-user workspace. "
-        "Authentication and shared database storage are required before enabling real sharing."
+        "This is a permission simulation for testing, not secure authentication. Anyone who can open "
+        "the public dashboard can change the mock identity selector. Add real login and a shared production "
+        "database before using this for confidential company data."
     )
+
 
 elif active_page == "Activity Log":
     st.subheader("Activity Log")
@@ -1592,10 +2168,13 @@ elif active_page == "Settings":
     settings_cols = st.columns(3)
     settings_cols[0].metric("Execution Mode", "Mock Mode")
     settings_cols[1].metric("Clay Connection", "Not Connected")
-    settings_cols[2].metric("Email Sending", "Disabled")
+    settings_cols[2].metric(
+        "Invitation Email",
+        "Configured" if invitation_email_is_configured() else "Not Configured",
+    )
     st.markdown("#### Current setup")
     st.write("- The dashboard uses fictional sample company and contact records.")
     st.write("- No Clay API requests are made and no Clay credits are consumed.")
     st.write("- Clay table URLs can be saved and opened, but the dashboard does not read or update Clay tables.")
-    st.write("- Email drafts can be reviewed and edited, but no email is sent from this dashboard.")
+    st.write("- Email drafts are not sent. Team invitations can be emailed when SMTP is configured in Streamlit Secrets.")
     st.write("- Campaign data is stored in the app's SQLite database.")
