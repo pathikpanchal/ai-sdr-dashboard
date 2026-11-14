@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import uuid
+import html
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +10,18 @@ APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "ai_sdr.db"
 
 st.set_page_config(page_title="AI SDR Dashboard", page_icon="🎯", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    [data-testid="stMetricValue"] {font-size: 1.8rem;}
+    [data-testid="stMetricLabel"] {font-size: 0.95rem;}
+    div[data-testid="stMarkdownContainer"] p {font-size: 1rem; line-height: 1.45;}
+    div[data-testid="stCaptionContainer"] p {font-size: 0.92rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 SENIORITY_OPTIONS = ["Manager", "Head", "Director", "VP", "C-Suite", "Owner / Founder"]
 JOB_LEVEL_OPTIONS = ["Above", "Any", "Below", "Exact"]
@@ -38,7 +51,8 @@ def get_connection():
             target_titles TEXT,
             min_score INTEGER,
             status TEXT,
-            created_at TEXT
+            created_at TEXT,
+            email_sequence_instructions TEXT DEFAULT ''
         )
         """
     )
@@ -50,6 +64,7 @@ def get_connection():
             company TEXT,
             website TEXT,
             company_type TEXT,
+            industry TEXT DEFAULT '',
             company_country TEXT,
             contact_name TEXT,
             title TEXT,
@@ -77,8 +92,11 @@ def get_connection():
             "department": "TEXT DEFAULT ''",
             "seniority": "TEXT DEFAULT 'Manager'",
             "job_level": "TEXT DEFAULT 'Above'",
+            "email_sequence_instructions": "TEXT DEFAULT ''",
+            "clay_table_url": "TEXT DEFAULT ''",
         },
         "leads": {
+            "industry": "TEXT DEFAULT ''",
             "company_cms": "TEXT DEFAULT ''",
             "department": "TEXT DEFAULT ''",
             "seniority": "TEXT DEFAULT ''",
@@ -105,31 +123,153 @@ def normalize(value):
     return " ".join(str(value or "").strip().lower().split())
 
 
+def split_filter_values(query):
+    """Split a multi-value filter on commas or semicolons and normalize each option."""
+    raw = str(query or "").replace(";", ",").replace("\n", ",")
+    return [normalize(part) for part in raw.split(",") if normalize(part)]
+
+
 def text_filter_matches(query, *values):
-    """Free-text filters accept comma-separated alternatives; blank means no restriction."""
-    query = normalize(query)
-    if not query:
+    """Match any comma/semicolon-separated option; blank means no restriction."""
+    options = split_filter_values(query)
+    if not options:
         return True
-    options = [normalize(part) for part in str(query).split(",") if normalize(part)]
-    searchable = [normalize(value) for value in values if normalize(value)]
+
+    def normalize_industry_terms(value):
+        value = normalize(value)
+        # Treat common singular/plural forms as equivalent for industry matching.
+        value = value.replace("pharmaceuticals", "pharmaceutical")
+        value = value.replace("retails", "retail")
+        return value
+
+    options = [normalize_industry_terms(option) for option in options]
+    searchable = [
+        normalize_industry_terms(value)
+        for value in values
+        if normalize_industry_terms(value)
+    ]
     return any(option in item or item in option for option in options for item in searchable)
 
 
+def normalize_country_name(value):
+    """Normalize country names and common ISO/name abbreviations to one canonical name."""
+    import re
+
+    token = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    token = " ".join(token.split())
+
+    # Common country names, short forms, and ISO-2 / ISO-3 codes.
+    # All aliases in each group resolve to the first (canonical) name.
+    country_alias_groups = {
+        "united states": {
+            "united states", "united states of america", "us", "usa", "u s",
+            "u s a", "america", "us of america", "united states america",
+        },
+        "united kingdom": {
+            "united kingdom", "uk", "u k", "gb", "gbr", "great britain",
+            "britain", "england", "scotland", "wales", "northern ireland",
+        },
+        "india": {"india", "in", "ind"},
+        "canada": {"canada", "ca", "can"},
+        "australia": {"australia", "au", "aus"},
+        "new zealand": {"new zealand", "nz", "nzl"},
+        "germany": {"germany", "de", "deu"},
+        "france": {"france", "fr", "fra"},
+        "italy": {"italy", "it", "ita"},
+        "spain": {"spain", "es", "esp"},
+        "netherlands": {"netherlands", "the netherlands", "nl", "nld", "holland"},
+        "ireland": {"ireland", "ie", "irl"},
+        "switzerland": {"switzerland", "ch", "che"},
+        "belgium": {"belgium", "be", "bel"},
+        "sweden": {"sweden", "se", "swe"},
+        "norway": {"norway", "no", "nor"},
+        "denmark": {"denmark", "dk", "dnk"},
+        "finland": {"finland", "fi", "fin"},
+        "poland": {"poland", "pl", "pol"},
+        "portugal": {"portugal", "pt", "prt"},
+        "austria": {"austria", "at", "aut"},
+        "czechia": {"czechia", "czech republic", "cz", "cze"},
+        "romania": {"romania", "ro", "rou"},
+        "greece": {"greece", "gr", "grc"},
+        "turkey": {"turkey", "türkiye", "turkiye", "tr", "tur"},
+        "united arab emirates": {
+            "united arab emirates", "uae", "u a e", "ae", "are", "emirates",
+        },
+        "saudi arabia": {"saudi arabia", "ksa", "sa", "sau"},
+        "qatar": {"qatar", "qa", "qat"},
+        "kuwait": {"kuwait", "kw", "kwt"},
+        "bahrain": {"bahrain", "bh", "bhr"},
+        "oman": {"oman", "om", "omn"},
+        "singapore": {"singapore", "sg", "sgp"},
+        "japan": {"japan", "jp", "jpn"},
+        "china": {"china", "cn", "chn"},
+        "hong kong": {"hong kong", "hk", "hkg"},
+        "south korea": {"south korea", "korea republic", "kr", "kor"},
+        "taiwan": {"taiwan", "tw", "twn"},
+        "malaysia": {"malaysia", "my", "mys"},
+        "indonesia": {"indonesia", "id", "idn"},
+        "thailand": {"thailand", "th", "tha"},
+        "vietnam": {"vietnam", "viet nam", "vn", "vnm"},
+        "philippines": {"philippines", "ph", "phl"},
+        "pakistan": {"pakistan", "pk", "pak"},
+        "bangladesh": {"bangladesh", "bd", "bgd"},
+        "sri lanka": {"sri lanka", "lk", "lka"},
+        "south africa": {"south africa", "za", "zaf"},
+        "nigeria": {"nigeria", "ng", "nga"},
+        "kenya": {"kenya", "ke", "ken"},
+        "egypt": {"egypt", "eg", "egy"},
+        "morocco": {"morocco", "ma", "mar"},
+        "ghana": {"ghana", "gh", "gha"},
+        "brazil": {"brazil", "br", "bra"},
+        "mexico": {"mexico", "mx", "mex"},
+        "argentina": {"argentina", "ar", "arg"},
+        "chile": {"chile", "cl", "chl"},
+        "colombia": {"colombia", "co", "col"},
+        "peru": {"peru", "pe", "per"},
+        "ukraine": {"ukraine", "ua", "ukr"},
+        "russia": {"russia", "ru", "rus"},
+        "israel": {"israel", "il", "isr"},
+        "luxembourg": {"luxembourg", "lu", "lux"},
+    }
+
+    for canonical, aliases in country_alias_groups.items():
+        if token in aliases:
+            return canonical
+    return token
+
+
 def country_filter_matches(query, country):
-    query_norm = normalize(query)
-    if not query_norm:
+    """Match any supplied country name or abbreviation using canonical country names."""
+    options = split_filter_values(query)
+    if not options:
         return True
 
-    aliases = {
-        "uk": "united kingdom",
-        "gb": "united kingdom",
-        "great britain": "united kingdom",
-        "us": "united states",
-        "usa": "united states",
+    actual_country = normalize_country_name(country)
+    normalized_options = [normalize_country_name(option) for option in options]
+    return actual_country in normalized_options
+
+
+
+def job_title_filter_matches(query, title):
+    """Match job titles, including common executive-title abbreviations."""
+    title_aliases = {
+        "cmo": "chief marketing officer",
+        "ceo": "chief executive officer",
+        "cfo": "chief financial officer",
+        "cto": "chief technology officer",
+        "coo": "chief operating officer",
+        "svp": "senior vice president",
+        "evp": "executive vice president",
     }
-    query_norm = aliases.get(query_norm, query_norm)
-    country_norm = aliases.get(normalize(country), normalize(country))
-    return query_norm in country_norm or country_norm in query_norm
+    options = split_filter_values(query)
+    if not options:
+        return True
+    expanded_options = []
+    for option in options:
+        expanded_options.append(option)
+        if option in title_aliases:
+            expanded_options.append(title_aliases[option])
+    return text_filter_matches(", ".join(expanded_options), title)
 
 
 def classify_seniority(title):
@@ -153,14 +293,27 @@ def seniority_matches(selected_seniority, job_level, actual_seniority):
     if job_level == "Any":
         return True
 
-    selected_rank = SENIORITY_RANK.get(selected_seniority, 1)
-    actual_rank = SENIORITY_RANK.get(actual_seniority, 1)
+    if isinstance(selected_seniority, (list, tuple, set)):
+        selected_levels = list(selected_seniority)
+    else:
+        selected_levels = split_filter_values(selected_seniority)
 
+    selected_ranks = [
+        SENIORITY_RANK[level]
+        for level in selected_levels
+        if level in SENIORITY_RANK
+    ]
+    if not selected_ranks:
+        return True
+
+    actual_rank = SENIORITY_RANK.get(actual_seniority, 1)
     if job_level == "Above":
-        return actual_rank >= selected_rank
+        # With multiple selected levels, use the lowest selected level as the baseline.
+        return actual_rank >= min(selected_ranks)
     if job_level == "Below":
-        return actual_rank <= selected_rank
-    return actual_rank == selected_rank  # Exact
+        # With multiple selected levels, use the highest selected level as the baseline.
+        return actual_rank <= max(selected_ranks)
+    return actual_rank in selected_ranks  # Exact
 
 
 def synthetic_records():
@@ -263,6 +416,38 @@ def synthetic_records():
             "reason": "Generic industrial manufacturer; not a pharmaceutical business.",
         },
         {
+            "company": "Brightwell Retail Group",
+            "website": "https://brightwell-retail.example",
+            "company_type": "Multi-channel retail company",
+            "industry": "Retail",
+            "company_country": "United Kingdom",
+            "company_cms": "Shopify",
+            "contact_name": "Grace Morgan",
+            "title": "Marketing Director",
+            "department": "Marketing",
+            "contact_country": "United Kingdom",
+            "email": "grace.morgan@brightwell-retail.example",
+            "company_score": 89,
+            "contact_score": 91,
+            "reason": "UK retail business with a senior marketing decision-maker.",
+        },
+        {
+            "company": "Northstar Consumer Retail",
+            "website": "https://northstar-retail.example",
+            "company_type": "Retail and ecommerce group",
+            "industry": "Retail",
+            "company_country": "United Kingdom",
+            "company_cms": "Magento",
+            "contact_name": "Daniel Foster",
+            "title": "Chief Marketing Officer",
+            "department": "Marketing",
+            "contact_country": "United Kingdom",
+            "email": "daniel.foster@northstar-retail.example",
+            "company_score": 92,
+            "contact_score": 94,
+            "reason": "UK retail and ecommerce group with an executive marketing owner.",
+        },
+        {
             "company": "Alpine Pharma Europe",
             "website": "https://alpine.example",
             "company_type": "Pharmaceutical manufacturer",
@@ -298,6 +483,8 @@ def run_mock_research(campaign):
             continue
         if not text_filter_matches(campaign["department"], record["department"]):
             continue
+        if not job_title_filter_matches(campaign.get("target_titles", ""), record["title"]):
+            continue
 
         actual_seniority = classify_seniority(record["title"])
         if not seniority_matches(
@@ -320,6 +507,7 @@ def run_mock_research(campaign):
                 "company": record["company"],
                 "website": record["website"],
                 "company_type": record["company_type"],
+                "industry": record["industry"],
                 "company_country": record["company_country"],
                 "contact_name": record["contact_name"],
                 "title": record["title"],
@@ -358,6 +546,109 @@ def run_mock_research(campaign):
     return results
 
 
+
+def mock_research_diagnostics(campaign):
+    """Return remaining mock-record counts after each campaign filter."""
+    remaining = synthetic_records()
+    diagnostics = [("Available mock records", len(remaining))]
+
+    def apply_filter(label, predicate):
+        nonlocal remaining
+        remaining = [record for record in remaining if predicate(record)]
+        diagnostics.append((label, len(remaining)))
+
+    apply_filter(
+        "Industry",
+        lambda record: text_filter_matches(
+            campaign["industry"], record["industry"], record["company_type"]
+        ),
+    )
+    apply_filter(
+        "Company country",
+        lambda record: country_filter_matches(
+            campaign["company_country"], record["company_country"]
+        ),
+    )
+    apply_filter(
+        "Contact country",
+        lambda record: country_filter_matches(
+            campaign["contact_country"], record["contact_country"]
+        ),
+    )
+    apply_filter(
+        "Current CMS",
+        lambda record: text_filter_matches(
+            campaign["current_cms"], record["company_cms"]
+        ),
+    )
+    apply_filter(
+        "Department",
+        lambda record: text_filter_matches(
+            campaign["department"], record["department"]
+        ),
+    )
+    apply_filter(
+        "Job Titles",
+        lambda record: job_title_filter_matches(
+            campaign.get("target_titles", ""), record["title"]
+        ),
+    )
+    apply_filter(
+        "Seniority / job level",
+        lambda record: seniority_matches(
+            campaign["seniority"],
+            campaign["job_level"],
+            classify_seniority(record["title"]),
+        ),
+    )
+    return diagnostics
+
+
+
+def build_email_sequence_prompt(campaign, lead):
+    """Assemble campaign instructions and prospect context for a future AI handoff."""
+    instructions = (campaign.get("email_sequence_instructions") or "").strip()
+    if not instructions:
+        instructions = "Use sensible, concise B2B outbound best practices."
+
+    return f"""Create a personalized 3-email outbound sequence for this prospect.
+
+CAMPAIGN
+Campaign name: {campaign.get('name', '')}
+Industry: {campaign.get('industry', '')}
+Company country: {campaign.get('company_country', '')}
+Contact country: {campaign.get('contact_country', '')}
+Department: {campaign.get('department', '')}
+Seniority: {campaign.get('seniority', '')}
+Job level: {campaign.get('job_level', '')}
+
+USER'S EMAIL SEQUENCE INSTRUCTIONS
+{instructions}
+
+PROSPECT CONTEXT
+Company: {lead.get('company', '')}
+Website: {lead.get('website', '')}
+Company type: {lead.get('company_type', '')}
+Industry: {lead.get('industry', '')}
+Current CMS: {lead.get('company_cms', '')}
+Contact: {lead.get('contact_name', '')}
+Job title: {lead.get('title', '')}
+Department: {lead.get('department', '')}
+Country: {lead.get('contact_country', '')}
+Reason for ICP match: {lead.get('reason', '')}
+
+REQUIREMENTS
+- Write 3 connected emails, not 3 unrelated messages.
+- Personalize using only the prospect facts supplied above.
+- Do not invent company news, results, technology usage, or personal details.
+- Keep the writing natural, concise, and relevant to the contact's role.
+- Give each email a subject line and body.
+- Make follow-up emails add context rather than repeat the first email.
+- Follow the user's instructions above wherever they do not conflict with factual accuracy.
+- Return drafts for human review; do not send any email.
+"""
+
+
 def load_campaigns():
     return pd.read_sql_query("SELECT * FROM campaigns ORDER BY created_at DESC", conn)
 
@@ -365,6 +656,69 @@ def load_campaigns():
 def campaign_label(campaign_id, campaigns):
     match = campaigns[campaigns["id"] == campaign_id]
     return match.iloc[0]["name"] if not match.empty else campaign_id
+
+
+
+def on_overview_campaign_checkbox_change(campaign_id, campaign_ids):
+    """Keep campaign preview selection single-select while using checkbox controls."""
+    clicked_key = f"overview_pick_{campaign_id}"
+    if st.session_state.get(clicked_key, False):
+        selected_id = campaign_id
+    else:
+        selected_id = next(
+            (
+                item for item in campaign_ids
+                if st.session_state.get(f"overview_pick_{item}", False)
+            ),
+            campaign_ids[0] if campaign_ids else None,
+        )
+
+    st.session_state["overview_campaign"] = selected_id
+    for item in campaign_ids:
+        st.session_state[f"overview_pick_{item}"] = item == selected_id
+
+    # If the user changes selection, close any previously opened editor.
+    st.session_state["editing_campaign_id"] = None
+
+
+def insert_mock_research_results(campaign_id, records):
+    """Replace a campaign's mock results and update its status."""
+    conn.execute("DELETE FROM leads WHERE campaign_id = ?", (campaign_id,))
+    if records:
+        conn.executemany(
+            """
+            INSERT INTO leads
+            (id, campaign_id, company, website, company_type, industry, company_country,
+             contact_name, title, contact_country, email, company_score, contact_score,
+             qualification, reason, email1_subject, email1_body, email2_subject,
+             email2_body, email3_subject, email3_body, review_status,
+             company_cms, department, seniority)
+            VALUES
+            (:id, :campaign_id, :company, :website, :company_type, :industry, :company_country,
+             :contact_name, :title, :contact_country, :email, :company_score, :contact_score,
+             :qualification, :reason, :email1_subject, :email1_body, :email2_subject,
+             :email2_body, :email3_subject, :email3_body, :review_status,
+             :company_cms, :department, :seniority)
+            """,
+            records,
+        )
+    new_status = "Draft ready" if records else "No matches"
+    conn.execute(
+        "UPDATE campaigns SET status = ? WHERE id = ?",
+        (new_status, campaign_id),
+    )
+    conn.commit()
+    return new_status
+
+
+def format_created_date(value):
+    """Show the campaign creation date without the time component."""
+    if not value:
+        return "—"
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).strftime("%d %b %Y")
+    except (TypeError, ValueError):
+        return str(value)[:10]
 
 
 st.title("AI SDR Dashboard")
@@ -382,95 +736,477 @@ with st.sidebar:
 
 tabs = st.tabs(["Campaigns", "Create campaign", "Leads & email review"])
 
+# Display the last research result after the app reruns, so the message and
+# filter diagnostics remain visible instead of being cleared by st.rerun().
+campaign_edit_notice = st.session_state.pop("campaign_edit_notice", None)
+if campaign_edit_notice:
+    st.success(campaign_edit_notice)
+
+last_research_notice = st.session_state.pop("last_research_notice", None)
+if last_research_notice:
+    if last_research_notice["found"]:
+        st.success(
+            f"Mock research complete: {last_research_notice['count']} matching contacts found; "
+            f"{last_research_notice['qualified_count']} passed the ICP score threshold."
+        )
+    else:
+        st.warning(
+            "No sample records matched all selected filters. The filter diagnostics below "
+            "show where the records were excluded. No Clay search was performed."
+        )
+        with st.expander("Why were no records found? — filter diagnostics", expanded=True):
+            st.caption("Counts show how many fictional sample records remain after each filter.")
+            for filter_name, remaining_count in last_research_notice["diagnostics"]:
+                st.write(f"**{filter_name}:** {remaining_count}")
+            st.caption(
+                "The minimum ICP score labels records as Qualified or Review / Exclude; "
+                "it does not remove them from the results."
+            )
+
 with tabs[0]:
     st.subheader("Campaign overview")
+    st.caption(
+        "A clear view of your campaigns, target audience, research results, and Clay table links."
+    )
+    delete_notice = st.session_state.pop("campaign_delete_notice", None)
+    if delete_notice:
+        st.success(delete_notice)
+
     campaigns = load_campaigns()
+    if not campaigns.empty:
+        lead_counts = pd.read_sql_query(
+            """
+            SELECT campaign_id,
+                   COUNT(DISTINCT company) AS total_companies,
+                   COUNT(*) AS total_contacts
+            FROM leads
+            GROUP BY campaign_id
+            """,
+            conn,
+        )
+        campaigns = campaigns.merge(
+            lead_counts, how="left", left_on="id", right_on="campaign_id"
+        )
+        campaigns["total_companies"] = campaigns["total_companies"].fillna(0).astype(int)
+        campaigns["total_contacts"] = campaigns["total_contacts"].fillna(0).astype(int)
 
     if campaigns.empty:
         st.info("No campaigns yet. Create your first campaign in the Create campaign tab.")
+        selected_id = None
+        selected_row = None
     else:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Campaigns", len(campaigns))
-        col2.metric("Draft ready", int((campaigns["status"] == "Draft ready").sum()))
-        col3.metric("Research simulated", int((campaigns["status"] == "Research simulated").sum()))
+        total_campaigns = len(campaigns)
+        ready_campaigns = int((campaigns["status"] == "Draft ready").sum())
+        total_companies = int(campaigns["total_companies"].sum())
+        total_contacts = int(campaigns["total_contacts"].sum())
 
-        display_columns = [
-            "name", "industry", "company_country", "contact_country",
-            "current_cms", "department", "seniority", "job_level",
-            "status", "created_at"
-        ]
-        st.dataframe(
-            campaigns[display_columns],
-            use_container_width=True,
-            hide_index=True,
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Campaigns", total_campaigns)
+        metric_cols[1].metric("Company matches", total_companies)
+        metric_cols[2].metric("Contact matches", total_contacts)
+        metric_cols[3].metric("Drafts ready", ready_campaigns)
+
+        st.markdown("#### Campaign preview")
+        st.caption(
+            "Select one campaign using the checkbox. Its filters appear automatically. "
+            "Use Edit, Duplicate, or Delete directly from that campaign's row."
         )
 
-        selected_id = st.selectbox(
-            "Select a campaign",
-            campaigns["id"].tolist(),
-            format_func=lambda campaign_id: campaign_label(campaign_id, campaigns),
-            key="overview_campaign",
-        )
+        campaign_ids = campaigns["id"].tolist()
+        current_selected = st.session_state.get("overview_campaign")
+        if current_selected not in campaign_ids:
+            current_selected = campaign_ids[0]
+            st.session_state["overview_campaign"] = current_selected
+
+        # Keep exactly one checkbox selected and make it follow the selected campaign.
+        for campaign_id in campaign_ids:
+            st.session_state[f"overview_pick_{campaign_id}"] = (
+                campaign_id == current_selected
+            )
+
+        # Use fewer, wider columns so the row actions remain visible.
+        table_widths = [0.45, 4.10, 0.95, 0.90, 1.25, 0.95]
+        header_cols = st.columns(table_widths)
+        headers = ["Select", "Campaign / activity", "Status", "Edit", "Duplicate", "Delete"]
+        for header_col, label in zip(header_cols, headers):
+            header_col.markdown(f"**{label}**")
+
+        st.divider()
+        for _, campaign_row in campaigns.iterrows():
+            campaign_id = campaign_row["id"]
+            row_cols = st.columns(table_widths)
+
+            with row_cols[0]:
+                st.checkbox(
+                    "Select campaign",
+                    key=f"overview_pick_{campaign_id}",
+                    label_visibility="collapsed",
+                    on_change=on_overview_campaign_checkbox_change,
+                    args=(campaign_id, campaign_ids),
+                )
+
+            with row_cols[1]:
+                campaign_name_display = str(campaign_row["name"] or "Untitled campaign")
+                st.markdown(f"**{html.escape(campaign_name_display)}**")
+                activity_summary = (
+                    f"Created: {format_created_date(campaign_row['created_at'])}  ·  "
+                    f"Companies: {int(campaign_row['total_companies'])}  ·  "
+                    f"Contacts: {int(campaign_row['total_contacts'])}"
+                )
+                st.caption(activity_summary)
+                clay_url = str(campaign_row.get("clay_table_url", "") or "").strip()
+                if clay_url:
+                    st.markdown(
+                        f"[Open Clay table]({html.escape(clay_url, quote=True)})"
+                    )
+                if campaign_id == current_selected:
+                    st.caption("Selected — campaign filters are shown below.")
+
+            row_cols[2].write(str(campaign_row["status"] or "Draft"))
+
+            with row_cols[3]:
+                if st.button(
+                    "Edit",
+                    key=f"overview_edit_{campaign_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state["overview_campaign"] = campaign_id
+                    st.session_state["editing_campaign_id"] = campaign_id
+                    st.rerun()
+
+            with row_cols[4]:
+                if st.button(
+                    "Duplicate",
+                    key=f"overview_duplicate_{campaign_id}",
+                    use_container_width=True,
+                ):
+                    new_id = str(uuid.uuid4())
+                    conn.execute(
+                        """
+                        INSERT INTO campaigns
+                        (id, name, industry, company_country, contact_country, target_titles,
+                         min_score, status, created_at, current_cms, department, seniority,
+                         job_level, email_sequence_instructions, clay_table_url)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_id,
+                            str(campaign_row["name"] or "Untitled campaign") + " (Copy)",
+                            campaign_row["industry"] or "",
+                            campaign_row["company_country"] or "",
+                            campaign_row["contact_country"] or "",
+                            campaign_row["target_titles"] or "",
+                            int(campaign_row["min_score"]),
+                            "Draft",
+                            datetime.now().isoformat(timespec="seconds"),
+                            campaign_row.get("current_cms", "") or "",
+                            campaign_row.get("department", "") or "",
+                            campaign_row.get("seniority", "Manager") or "Manager",
+                            campaign_row.get("job_level", "Above") or "Above",
+                            campaign_row.get("email_sequence_instructions", "") or "",
+                            "",  # A duplicate starts without a Clay table link.
+                        ),
+                    )
+                    conn.commit()
+                    st.session_state["overview_campaign"] = new_id
+                    st.session_state["editing_campaign_id"] = None
+                    st.session_state["campaign_duplicate_notice"] = (
+                        "Campaign duplicated with its filters and email instructions."
+                    )
+                    st.rerun()
+
+            with row_cols[5]:
+                if st.button(
+                    "Delete",
+                    key=f"overview_delete_{campaign_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state["pending_delete_campaign"] = campaign_id
+                    st.rerun()
+
+            st.divider()
+
+        duplicate_notice = st.session_state.pop("campaign_duplicate_notice", None)
+        if duplicate_notice:
+            st.success(duplicate_notice)
+
+        pending_delete_id = st.session_state.get("pending_delete_campaign")
+        if pending_delete_id in campaign_ids:
+            pending_delete_name = campaign_label(pending_delete_id, campaigns)
+            with st.container(border=True):
+                st.warning(
+                    f"Delete **{pending_delete_name}** and all of its local mock results? "
+                    "This cannot be undone."
+                )
+                confirm_col, cancel_col = st.columns(2)
+                with confirm_col:
+                    if st.button(
+                        "Yes, delete campaign",
+                        key="confirm_delete_campaign",
+                        type="primary",
+                    ):
+                        conn.execute(
+                            "DELETE FROM leads WHERE campaign_id = ?", (pending_delete_id,)
+                        )
+                        conn.execute(
+                            "DELETE FROM campaigns WHERE id = ?", (pending_delete_id,)
+                        )
+                        conn.commit()
+
+                        remaining_ids = [
+                            item for item in campaign_ids if item != pending_delete_id
+                        ]
+                        fallback_id = remaining_ids[0] if remaining_ids else None
+                        st.session_state.pop("pending_delete_campaign", None)
+                        st.session_state.pop("editing_campaign_id", None)
+                        for state_key in (
+                            "overview_campaign",
+                            "active_campaign_id",
+                            "run_campaign_selector",
+                            "lead_campaign_selector",
+                        ):
+                            if st.session_state.get(state_key) == pending_delete_id:
+                                if fallback_id:
+                                    st.session_state[state_key] = fallback_id
+                                else:
+                                    st.session_state.pop(state_key, None)
+                        st.session_state["campaign_delete_notice"] = (
+                            "Campaign and its local mock leads have been deleted."
+                        )
+                        st.rerun()
+                with cancel_col:
+                    if st.button("Cancel", key="cancel_delete_campaign"):
+                        st.session_state.pop("pending_delete_campaign", None)
+                        st.rerun()
+
+        selected_id = st.session_state.get("overview_campaign", campaign_ids[0])
         selected_row = campaigns[campaigns["id"] == selected_id].iloc[0]
 
-        with st.expander("View selected campaign filters"):
-            st.write(f"**Industry:** {selected_row['industry']}")
-            st.write(f"**Company country:** {selected_row['company_country']}")
-            st.write(f"**Contact country:** {selected_row['contact_country']}")
-            st.write(f"**Current CMS:** {selected_row['current_cms'] or 'Any'}")
-            st.write(f"**Department:** {selected_row['department'] or 'Any'}")
-            st.write(f"**Seniority:** {selected_row['seniority']}")
-            st.write(f"**Job level:** {selected_row['job_level']}")
-            st.write(f"**Minimum ICP score:** {selected_row['min_score']}")
+        st.markdown(f"#### Selected campaign filters: {html.escape(str(selected_row['name']))}")
+        with st.container(border=True):
+            filter_cols = st.columns(3)
+            filter_cols[0].write(f"**Industry**\n\n{selected_row['industry'] or 'Any'}")
+            filter_cols[1].write(
+                f"**Company country**\n\n{selected_row['company_country'] or 'Any'}"
+            )
+            filter_cols[2].write(
+                f"**Contact country**\n\n{selected_row['contact_country'] or 'Any'}"
+            )
+            filter_cols = st.columns(3)
+            filter_cols[0].write(
+                f"**Job titles**\n\n{selected_row['target_titles'] or 'Any'}"
+            )
+            filter_cols[1].write(
+                f"**Current CMS**\n\n{selected_row['current_cms'] or 'Any'}"
+            )
+            filter_cols[2].write(
+                f"**Department**\n\n{selected_row['department'] or 'Any'}"
+            )
+            filter_cols = st.columns(3)
+            filter_cols[0].write(
+                f"**Seniority**\n\n{selected_row['seniority'] or 'Any'}"
+            )
+            filter_cols[1].write(
+                f"**Job level**\n\n{selected_row['job_level'] or 'Any'}"
+            )
+            filter_cols[2].write(f"**Minimum ICP score**\n\n{int(selected_row['min_score'])}/100")
+            st.write(
+                "**Email Sequence Instructions**\n\n"
+                + (
+                    selected_row.get("email_sequence_instructions", "")
+                    or "No custom instructions added."
+                )
+            )
+            clay_table_url = str(selected_row.get("clay_table_url", "") or "").strip()
+            if clay_table_url:
+                st.link_button("Open Clay table", clay_table_url)
+            else:
+                st.caption("Clay table link: Not added yet")
 
-        action_col1, action_col2 = st.columns(2)
-        with action_col1:
-            if st.button("Duplicate selected campaign"):
-                new_id = str(uuid.uuid4())
-                conn.execute(
-                    """
-                    INSERT INTO campaigns
-                    (id, name, industry, company_country, contact_country, target_titles,
-                     min_score, status, created_at, current_cms, department, seniority, job_level)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        new_id,
-                        selected_row["name"] + " (Copy)",
-                        selected_row["industry"],
-                        selected_row["company_country"],
-                        selected_row["contact_country"],
-                        selected_row["target_titles"] or "",
-                        int(selected_row["min_score"]),
-                        "Draft",
-                        datetime.now().isoformat(timespec="seconds"),
-                        selected_row["current_cms"] or "",
-                        selected_row["department"] or "",
-                        selected_row["seniority"] or "Manager",
-                        selected_row["job_level"] or "Above",
+        if st.session_state.get("editing_campaign_id") == selected_id:
+            st.markdown("#### Edit campaign filters")
+            st.caption(
+                "Broaden or refine the criteria, then save the changes or save and run "
+                "the search again using the updated filters."
+            )
+            saved_seniority = [
+                value.strip()
+                for value in str(selected_row["seniority"] or "Manager").split(",")
+                if value.strip() in SENIORITY_OPTIONS
+            ] or ["Manager"]
+
+            with st.form(f"edit_campaign_form_{selected_id}"):
+                edit_name = st.text_input(
+                    "Campaign Name", value=str(selected_row["name"] or "")
+                )
+                edit_industry = st.text_input(
+                    "Industry",
+                    value=str(selected_row["industry"] or ""),
+                    help="Enter multiple industries separated by commas, e.g. Pharmaceuticals, Retail.",
+                )
+                edit_company_country = st.text_input(
+                    "Company Country",
+                    value=str(selected_row["company_country"] or ""),
+                    help="Multiple countries are allowed, e.g. United Kingdom, Germany.",
+                )
+                edit_contact_country = st.text_input(
+                    "Contact Country",
+                    value=str(selected_row["contact_country"] or ""),
+                    help="Multiple countries are allowed, e.g. United Kingdom, Germany.",
+                )
+                edit_target_titles = st.text_input(
+                    "Job Titles",
+                    value=str(selected_row["target_titles"] or ""),
+                    help="Enter several job titles separated by commas, e.g. CMO, Marketing Director, Head of Marketing.",
+                )
+                edit_current_cms = st.text_input(
+                    "Current CMS",
+                    value=str(selected_row["current_cms"] or ""),
+                    help="Multiple CMS platforms are allowed, e.g. WordPress, Drupal, Sitecore.",
+                )
+                edit_department = st.text_input(
+                    "Department",
+                    value=str(selected_row["department"] or ""),
+                    help="Multiple departments are allowed, e.g. Marketing, Sales.",
+                )
+                edit_seniority = st.multiselect(
+                    "Seniority",
+                    SENIORITY_OPTIONS,
+                    default=saved_seniority,
+                    help="Select one or more seniority levels.",
+                )
+                edit_job_level = st.selectbox(
+                    "Job Level",
+                    JOB_LEVEL_OPTIONS,
+                    index=JOB_LEVEL_OPTIONS.index(
+                        selected_row["job_level"]
+                        if selected_row["job_level"] in JOB_LEVEL_OPTIONS
+                        else "Above"
+                    ),
+                    help=(
+                        "Above includes the selected level(s) and higher. Below includes "
+                        "the selected level(s) and lower. Exact matches only selected levels."
                     ),
                 )
-                conn.commit()
-                st.success("Campaign duplicated with all filters.")
+                edit_min_score = st.slider(
+                    "Minimum company and contact ICP score",
+                    min_value=0,
+                    max_value=100,
+                    value=int(selected_row["min_score"]),
+                )
+                edit_email_instructions = st.text_area(
+                    "Email Sequence Instructions",
+                    value=str(selected_row.get("email_sequence_instructions", "") or ""),
+                    height=150,
+                )
+                edit_clay_table_url = st.text_input(
+                    "Clay Table Link (optional)",
+                    value=str(selected_row.get("clay_table_url", "") or ""),
+                    placeholder="Paste the Clay table URL here when available",
+                    help="Save the Clay table URL for quick access. Clay is not connected in Mock Mode.",
+                )
+                save_changes = st.form_submit_button("Save changes")
+                save_and_rerun = st.form_submit_button(
+                    "Save changes & Re-run Search", type="primary"
+                )
+
+            if save_changes or save_and_rerun:
+                if not edit_name.strip():
+                    st.error("Please enter a campaign name.")
+                elif not edit_seniority and edit_job_level != "Any":
+                    st.error("Select at least one seniority level, or choose Job Level = Any.")
+                else:
+                    conn.execute(
+                        """
+                        UPDATE campaigns
+                        SET name = ?, industry = ?, company_country = ?, contact_country = ?,
+                            target_titles = ?, min_score = ?, current_cms = ?, department = ?,
+                            seniority = ?, job_level = ?, email_sequence_instructions = ?,
+                            clay_table_url = ?, status = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            edit_name.strip(),
+                            edit_industry.strip(),
+                            edit_company_country.strip(),
+                            edit_contact_country.strip(),
+                            edit_target_titles.strip(),
+                            int(edit_min_score),
+                            edit_current_cms.strip(),
+                            edit_department.strip(),
+                            ", ".join(edit_seniority),
+                            edit_job_level,
+                            edit_email_instructions.strip(),
+                            edit_clay_table_url.strip(),
+                            "Draft",
+                            selected_id,
+                        ),
+                    )
+
+                    if save_and_rerun:
+                        campaign_for_run = dict(selected_row)
+                        campaign_for_run.update(
+                            {
+                                "name": edit_name.strip(),
+                                "industry": edit_industry.strip(),
+                                "company_country": edit_company_country.strip(),
+                                "contact_country": edit_contact_country.strip(),
+                                "target_titles": edit_target_titles.strip(),
+                                "current_cms": edit_current_cms.strip(),
+                                "department": edit_department.strip(),
+                                "seniority": ", ".join(edit_seniority),
+                                "job_level": edit_job_level,
+                                "min_score": int(edit_min_score),
+                                "email_sequence_instructions": edit_email_instructions.strip(),
+                                "clay_table_url": edit_clay_table_url.strip(),
+                            }
+                        )
+                        records = run_mock_research(campaign_for_run)
+                        new_status = insert_mock_research_results(selected_id, records)
+                        st.session_state["last_research_notice"] = {
+                            "found": bool(records),
+                            "count": len(records),
+                            "qualified_count": sum(
+                                record["qualification"] == "Qualified"
+                                for record in records
+                            ),
+                            "diagnostics": (
+                                mock_research_diagnostics(campaign_for_run)
+                                if not records else []
+                            ),
+                        }
+                        st.session_state["campaign_edit_notice"] = (
+                            f"Campaign updated and search re-run. Status: {new_status}."
+                        )
+                    else:
+                        # Remove old results to avoid showing records that no longer match.
+                        conn.execute(
+                            "DELETE FROM leads WHERE campaign_id = ?", (selected_id,)
+                        )
+                        conn.commit()
+                        st.session_state["campaign_edit_notice"] = (
+                            "Campaign updated. Previous results were cleared. "
+                            "Use 'Save changes & Re-run Search' to search with the new filters."
+                        )
+
+                    st.session_state["active_campaign_id"] = selected_id
+                    st.session_state["run_campaign_selector"] = selected_id
+                    st.session_state["lead_campaign_selector"] = selected_id
+                    st.session_state["editing_campaign_id"] = None
+                    st.rerun()
+            if st.button(
+                "Cancel editing",
+                key=f"cancel_campaign_editor_{selected_id}",
+            ):
+                st.session_state["editing_campaign_id"] = None
                 st.rerun()
 
-        with action_col2:
-            confirm_delete = st.checkbox(
-                "I confirm I want to delete this campaign",
-                key=f"confirm_delete_{selected_id}",
-            )
-            if st.button("Delete selected campaign", disabled=not confirm_delete):
-                conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
-                conn.execute("DELETE FROM campaigns WHERE id = ?", (selected_id,))
-                conn.commit()
-                st.success("Campaign and its local mock leads have been deleted.")
-                st.rerun()
 
 with tabs[1]:
     st.subheader("Create campaign")
     st.caption(
-        "Industry, countries, CMS and department are free-text fields. "
-        "For fields that accept multiple values, separate them with commas."
+        "Use commas or semicolons to enter multiple values in a field. Values within one "
+        "field work as OR (e.g. Pharmaceuticals, Retail); different fields work as AND."
     )
 
     with st.form("create_campaign_form"):
@@ -493,6 +1229,12 @@ with tabs[1]:
             value="United Kingdom",
             placeholder="e.g. United Kingdom",
         )
+        target_titles = st.text_input(
+            "Job Titles",
+            value="",
+            placeholder="e.g. CMO, Marketing Director, Head of Marketing",
+            help="Enter multiple titles separated by commas. A blank field allows any job title.",
+        )
         current_cms = st.text_input(
             "Current CMS",
             value="",
@@ -506,10 +1248,11 @@ with tabs[1]:
 
         seniority_col, job_level_col = st.columns(2)
         with seniority_col:
-            seniority = st.selectbox(
+            seniority = st.multiselect(
                 "Seniority",
                 SENIORITY_OPTIONS,
-                index=SENIORITY_OPTIONS.index("Manager"),
+                default=["Manager"],
+                help="Select one or more seniority levels.",
             )
         with job_level_col:
             job_level = st.selectbox(
@@ -517,10 +1260,40 @@ with tabs[1]:
                 JOB_LEVEL_OPTIONS,
                 index=JOB_LEVEL_OPTIONS.index("Above"),
                 help=(
-                    "Above includes the selected seniority and every higher level. "
-                    "Below includes the selected level and every lower level."
+                    "Above includes the selected level(s) and higher. Below includes "
+                    "the selected level(s) and lower. Exact matches only selected levels."
                 ),
             )
+
+        clay_table_url = st.text_input(
+            "Clay Table Link (optional)",
+            value="",
+            placeholder="Paste the Clay table URL here when available",
+            help="You can add the Clay table link now or later by editing the campaign. Clay is not connected in Mock Mode.",
+        )
+
+        email_sequence_instructions = st.text_area(
+            "Email Sequence Instructions",
+            value=(
+                "Goal: Start relevant conversations with the target decision-maker.\n"
+                "Audience: Address the contact's role and business context.\n"
+                "Personalization: Use relevant company, industry, technology, and role details "
+                "only when available.\n"
+                "Tone: Professional, natural, concise, and conversational.\n"
+                "Call to action: Ask for the next step you want the prospect to take.\n"
+                "Avoid: Generic claims, exaggerated promises, and unsupported facts."
+            ),
+            height=150,
+            help=(
+                "Describe the sequence goal, audience, tone, personalization, offer, CTA, "
+                "and anything the emails should avoid. These instructions are saved with "
+                "the campaign and prepared for a future AI/Clay handoff."
+            ),
+        )
+        st.caption(
+            "Mock Mode saves these instructions and prepares a contact-specific prompt preview. "
+            "It does not send the instructions to Clay or generate AI-written emails."
+        )
 
         threshold = st.slider(
             "Minimum company and contact ICP score",
@@ -533,14 +1306,17 @@ with tabs[1]:
     if submitted:
         if not campaign_name.strip():
             st.error("Please enter a campaign name.")
+        elif not seniority and job_level != "Any":
+            st.error("Select at least one seniority level, or choose Job Level = Any.")
         else:
             campaign_id = str(uuid.uuid4())
             conn.execute(
                 """
                 INSERT INTO campaigns
                 (id, name, industry, company_country, contact_country, target_titles,
-                 min_score, status, created_at, current_cms, department, seniority, job_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 min_score, status, created_at, current_cms, department, seniority, job_level,
+                 email_sequence_instructions, clay_table_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     campaign_id,
@@ -548,18 +1324,22 @@ with tabs[1]:
                     industry.strip(),
                     company_country.strip(),
                     contact_country.strip(),
-                    "",
+                    target_titles.strip(),
                     threshold,
                     "Draft",
                     datetime.now().isoformat(timespec="seconds"),
                     current_cms.strip(),
                     department.strip(),
-                    seniority,
+                    ", ".join(seniority),
                     job_level,
+                    email_sequence_instructions.strip(),
+                    clay_table_url.strip(),
                 ),
             )
             conn.commit()
             st.session_state["active_campaign_id"] = campaign_id
+            st.session_state["run_campaign_selector"] = campaign_id
+            st.session_state["lead_campaign_selector"] = campaign_id
             st.success("Campaign configuration saved.")
 
     campaigns = load_campaigns()
@@ -592,50 +1372,22 @@ with tabs[1]:
             campaign = dict(zip(campaign_columns, campaign_row))
 
             # Re-running research replaces this campaign's previous mock results.
-            conn.execute("DELETE FROM leads WHERE campaign_id = ?", (run_campaign_id,))
             records = run_mock_research(campaign)
-
-            if records:
-                conn.executemany(
-                    """
-                    INSERT INTO leads
-                    (id, campaign_id, company, website, company_type, company_country,
-                     contact_name, title, contact_country, email, company_score, contact_score,
-                     qualification, reason, email1_subject, email1_body, email2_subject,
-                     email2_body, email3_subject, email3_body, review_status,
-                     company_cms, department, seniority)
-                    VALUES
-                    (:id, :campaign_id, :company, :website, :company_type, :company_country,
-                     :contact_name, :title, :contact_country, :email, :company_score, :contact_score,
-                     :qualification, :reason, :email1_subject, :email1_body, :email2_subject,
-                     :email2_body, :email3_subject, :email3_body, :review_status,
-                     :company_cms, :department, :seniority)
-                    """,
-                    records,
-                )
-                new_status = "Draft ready"
-            else:
-                new_status = "No matches"
-
-            conn.execute(
-                "UPDATE campaigns SET status = ? WHERE id = ?",
-                (new_status, run_campaign_id),
-            )
-            conn.commit()
+            new_status = insert_mock_research_results(run_campaign_id, records)
+            # Keep the Leads tab aligned with the campaign that was just researched.
+            st.session_state["lead_campaign_selector"] = run_campaign_id
 
             qualified_count = sum(
                 record["qualification"] == "Qualified" for record in records
             )
-            if records:
-                st.success(
-                    f"Mock research complete: {len(records)} matching contacts found; "
-                    f"{qualified_count} passed the ICP score threshold."
-                )
-            else:
-                st.warning(
-                    "No sample records matched all selected filters. Try broadening one or "
-                    "more filters. No Clay search was performed."
-                )
+            st.session_state["last_research_notice"] = {
+                "found": bool(records),
+                "count": len(records),
+                "qualified_count": qualified_count,
+                "diagnostics": (
+                    mock_research_diagnostics(campaign) if not records else []
+                ),
+            }
             st.rerun()
 
 with tabs[2]:
@@ -668,13 +1420,28 @@ with tabs[2]:
             )
 
             visible_columns = [
-                "company", "industry" if "industry" in leads.columns else "company_type",
-                "company_cms", "contact_name", "title", "department", "seniority",
+                "company", "company_type", "industry", "company_cms",
+                "contact_name", "title", "department", "seniority",
                 "company_country", "contact_country", "company_score", "contact_score",
                 "qualification",
             ]
+            lead_display_labels = {
+                "company": "Company Name",
+                "company_type": "Company Type",
+                "industry": "Industry",
+                "company_cms": "Current CMS",
+                "contact_name": "Contact Name",
+                "title": "Job Title",
+                "department": "Department",
+                "seniority": "Seniority",
+                "company_country": "Company Country",
+                "contact_country": "Contact Country",
+                "company_score": "Company ICP Score",
+                "contact_score": "Contact ICP Score",
+                "qualification": "ICP Qualification",
+            }
             st.dataframe(
-                leads[visible_columns],
+                leads[visible_columns].rename(columns=lead_display_labels),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -700,6 +1467,30 @@ with tabs[2]:
             )
             st.write("Reason:", row["reason"])
 
+            selected_campaign_row = conn.execute(
+                "SELECT * FROM campaigns WHERE id = ?", (selected_campaign_id,)
+            ).fetchone()
+            campaign_columns = [
+                item[1] for item in conn.execute("PRAGMA table_info(campaigns)").fetchall()
+            ]
+            selected_campaign = dict(zip(campaign_columns, selected_campaign_row))
+
+            with st.expander("Email Sequence Instructions"):
+                st.write(
+                    selected_campaign.get("email_sequence_instructions", "")
+                    or "No custom instructions were added to this campaign."
+                )
+
+            with st.expander("AI email-generation prompt preview (future Clay handoff)"):
+                st.caption(
+                    "This combines your campaign instructions with the selected contact's "
+                    "details. In Mock Mode it is only a preview; no AI or Clay request is made."
+                )
+                st.code(
+                    build_email_sequence_prompt(selected_campaign, row.to_dict()),
+                    language="text",
+                )
+
             for sequence_number in (1, 2, 3):
                 st.markdown(f"**Email {sequence_number}**")
                 st.text_input(
@@ -722,6 +1513,10 @@ with tabs[2]:
                 conn.commit()
                 st.success("Marked as approved for review. No email has been sent.")
 
+            st.caption(
+                "The visible email drafts are mock examples. Custom instructions are saved "
+                "and included in the prompt preview, but are not applied by an AI model in Mock Mode."
+            )
             st.warning(
                 "This MVP uses fictional sample data. It does not connect to Clay, "
                 "enrich real records, or send emails."
