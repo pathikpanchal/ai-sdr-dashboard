@@ -38,7 +38,8 @@ def get_connection():
             target_titles TEXT,
             min_score INTEGER,
             status TEXT,
-            created_at TEXT
+            created_at TEXT,
+            email_sequence_instructions TEXT DEFAULT ''
         )
         """
     )
@@ -50,6 +51,7 @@ def get_connection():
             company TEXT,
             website TEXT,
             company_type TEXT,
+            industry TEXT DEFAULT '',
             company_country TEXT,
             contact_name TEXT,
             title TEXT,
@@ -77,8 +79,10 @@ def get_connection():
             "department": "TEXT DEFAULT ''",
             "seniority": "TEXT DEFAULT 'Manager'",
             "job_level": "TEXT DEFAULT 'Above'",
+            "email_sequence_instructions": "TEXT DEFAULT ''",
         },
         "leads": {
+            "industry": "TEXT DEFAULT ''",
             "company_cms": "TEXT DEFAULT ''",
             "department": "TEXT DEFAULT ''",
             "seniority": "TEXT DEFAULT ''",
@@ -320,6 +324,7 @@ def run_mock_research(campaign):
                 "company": record["company"],
                 "website": record["website"],
                 "company_type": record["company_type"],
+                "industry": record["industry"],
                 "company_country": record["company_country"],
                 "contact_name": record["contact_name"],
                 "title": record["title"],
@@ -358,6 +363,103 @@ def run_mock_research(campaign):
     return results
 
 
+
+def mock_research_diagnostics(campaign):
+    """Return remaining mock-record counts after each campaign filter."""
+    remaining = synthetic_records()
+    diagnostics = [("Available mock records", len(remaining))]
+
+    def apply_filter(label, predicate):
+        nonlocal remaining
+        remaining = [record for record in remaining if predicate(record)]
+        diagnostics.append((label, len(remaining)))
+
+    apply_filter(
+        "Industry",
+        lambda record: text_filter_matches(
+            campaign["industry"], record["industry"], record["company_type"]
+        ),
+    )
+    apply_filter(
+        "Company country",
+        lambda record: country_filter_matches(
+            campaign["company_country"], record["company_country"]
+        ),
+    )
+    apply_filter(
+        "Contact country",
+        lambda record: country_filter_matches(
+            campaign["contact_country"], record["contact_country"]
+        ),
+    )
+    apply_filter(
+        "Current CMS",
+        lambda record: text_filter_matches(
+            campaign["current_cms"], record["company_cms"]
+        ),
+    )
+    apply_filter(
+        "Department",
+        lambda record: text_filter_matches(
+            campaign["department"], record["department"]
+        ),
+    )
+    apply_filter(
+        "Seniority / job level",
+        lambda record: seniority_matches(
+            campaign["seniority"],
+            campaign["job_level"],
+            classify_seniority(record["title"]),
+        ),
+    )
+    return diagnostics
+
+
+
+def build_email_sequence_prompt(campaign, lead):
+    """Assemble campaign instructions and prospect context for a future AI handoff."""
+    instructions = (campaign.get("email_sequence_instructions") or "").strip()
+    if not instructions:
+        instructions = "Use sensible, concise B2B outbound best practices."
+
+    return f"""Create a personalized 3-email outbound sequence for this prospect.
+
+CAMPAIGN
+Campaign name: {campaign.get('name', '')}
+Industry: {campaign.get('industry', '')}
+Company country: {campaign.get('company_country', '')}
+Contact country: {campaign.get('contact_country', '')}
+Department: {campaign.get('department', '')}
+Seniority: {campaign.get('seniority', '')}
+Job level: {campaign.get('job_level', '')}
+
+USER'S EMAIL SEQUENCE INSTRUCTIONS
+{instructions}
+
+PROSPECT CONTEXT
+Company: {lead.get('company', '')}
+Website: {lead.get('website', '')}
+Company type: {lead.get('company_type', '')}
+Industry: {lead.get('industry', '')}
+Current CMS: {lead.get('company_cms', '')}
+Contact: {lead.get('contact_name', '')}
+Job title: {lead.get('title', '')}
+Department: {lead.get('department', '')}
+Country: {lead.get('contact_country', '')}
+Reason for ICP match: {lead.get('reason', '')}
+
+REQUIREMENTS
+- Write 3 connected emails, not 3 unrelated messages.
+- Personalize using only the prospect facts supplied above.
+- Do not invent company news, results, technology usage, or personal details.
+- Keep the writing natural, concise, and relevant to the contact's role.
+- Give each email a subject line and body.
+- Make follow-up emails add context rather than repeat the first email.
+- Follow the user's instructions above wherever they do not conflict with factual accuracy.
+- Return drafts for human review; do not send any email.
+"""
+
+
 def load_campaigns():
     return pd.read_sql_query("SELECT * FROM campaigns ORDER BY created_at DESC", conn)
 
@@ -382,9 +484,48 @@ with st.sidebar:
 
 tabs = st.tabs(["Campaigns", "Create campaign", "Leads & email review"])
 
+# Display the last research result after the app reruns, so the message and
+# filter diagnostics remain visible instead of being cleared by st.rerun().
+last_research_notice = st.session_state.pop("last_research_notice", None)
+if last_research_notice:
+    if last_research_notice["found"]:
+        st.success(
+            f"Mock research complete: {last_research_notice['count']} matching contacts found; "
+            f"{last_research_notice['qualified_count']} passed the ICP score threshold."
+        )
+    else:
+        st.warning(
+            "No sample records matched all selected filters. The filter diagnostics below "
+            "show where the records were excluded. No Clay search was performed."
+        )
+        with st.expander("Why were no records found? — filter diagnostics", expanded=True):
+            st.caption("Counts show how many fictional sample records remain after each filter.")
+            for filter_name, remaining_count in last_research_notice["diagnostics"]:
+                st.write(f"**{filter_name}:** {remaining_count}")
+            st.caption(
+                "The minimum ICP score labels records as Qualified or Review / Exclude; "
+                "it does not remove them from the results."
+            )
+
 with tabs[0]:
     st.subheader("Campaign overview")
     campaigns = load_campaigns()
+    if not campaigns.empty:
+        lead_counts = pd.read_sql_query(
+            """
+            SELECT campaign_id,
+                   COUNT(DISTINCT company) AS total_companies,
+                   COUNT(*) AS total_contacts
+            FROM leads
+            GROUP BY campaign_id
+            """,
+            conn,
+        )
+        campaigns = campaigns.merge(
+            lead_counts, how="left", left_on="id", right_on="campaign_id"
+        )
+        campaigns["total_companies"] = campaigns["total_companies"].fillna(0).astype(int)
+        campaigns["total_contacts"] = campaigns["total_contacts"].fillna(0).astype(int)
 
     if campaigns.empty:
         st.info("No campaigns yet. Create your first campaign in the Create campaign tab.")
@@ -397,10 +538,24 @@ with tabs[0]:
         display_columns = [
             "name", "industry", "company_country", "contact_country",
             "current_cms", "department", "seniority", "job_level",
-            "status", "created_at"
+            "total_companies", "total_contacts", "status", "created_at"
         ]
+        campaign_display_labels = {
+            "name": "Campaign Name",
+            "industry": "Industry",
+            "company_country": "Company Country",
+            "contact_country": "Contact Country",
+            "current_cms": "Current CMS",
+            "department": "Department",
+            "seniority": "Seniority",
+            "job_level": "Job Level",
+            "total_companies": "Total Companies",
+            "total_contacts": "Total Contacts",
+            "status": "Status",
+            "created_at": "Created At",
+        }
         st.dataframe(
-            campaigns[display_columns],
+            campaigns[display_columns].rename(columns=campaign_display_labels),
             use_container_width=True,
             hide_index=True,
         )
@@ -422,6 +577,11 @@ with tabs[0]:
             st.write(f"**Seniority:** {selected_row['seniority']}")
             st.write(f"**Job level:** {selected_row['job_level']}")
             st.write(f"**Minimum ICP score:** {selected_row['min_score']}")
+            st.write("**Email Sequence Instructions:**")
+            st.write(
+                selected_row.get("email_sequence_instructions", "")
+                or "No custom instructions added."
+            )
 
         action_col1, action_col2 = st.columns(2)
         with action_col1:
@@ -431,8 +591,9 @@ with tabs[0]:
                     """
                     INSERT INTO campaigns
                     (id, name, industry, company_country, contact_country, target_titles,
-                     min_score, status, created_at, current_cms, department, seniority, job_level)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     min_score, status, created_at, current_cms, department, seniority, job_level,
+                     email_sequence_instructions)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_id,
@@ -448,6 +609,7 @@ with tabs[0]:
                         selected_row["department"] or "",
                         selected_row["seniority"] or "Manager",
                         selected_row["job_level"] or "Above",
+                        selected_row.get("email_sequence_instructions", "") or "",
                     ),
                 )
                 conn.commit()
@@ -522,6 +684,29 @@ with tabs[1]:
                 ),
             )
 
+        email_sequence_instructions = st.text_area(
+            "Email Sequence Instructions",
+            value=(
+                "Goal: Start relevant conversations with the target decision-maker.\n"
+                "Audience: Address the contact's role and business context.\n"
+                "Personalization: Use relevant company, industry, technology, and role details "
+                "only when available.\n"
+                "Tone: Professional, natural, concise, and conversational.\n"
+                "Call to action: Ask for the next step you want the prospect to take.\n"
+                "Avoid: Generic claims, exaggerated promises, and unsupported facts."
+            ),
+            height=150,
+            help=(
+                "Describe the sequence goal, audience, tone, personalization, offer, CTA, "
+                "and anything the emails should avoid. These instructions are saved with "
+                "the campaign and prepared for a future AI/Clay handoff."
+            ),
+        )
+        st.caption(
+            "Mock Mode saves these instructions and prepares a contact-specific prompt preview. "
+            "It does not send the instructions to Clay or generate AI-written emails."
+        )
+
         threshold = st.slider(
             "Minimum company and contact ICP score",
             min_value=0,
@@ -539,8 +724,9 @@ with tabs[1]:
                 """
                 INSERT INTO campaigns
                 (id, name, industry, company_country, contact_country, target_titles,
-                 min_score, status, created_at, current_cms, department, seniority, job_level)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 min_score, status, created_at, current_cms, department, seniority, job_level,
+                 email_sequence_instructions)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     campaign_id,
@@ -556,10 +742,13 @@ with tabs[1]:
                     department.strip(),
                     seniority,
                     job_level,
+                    email_sequence_instructions.strip(),
                 ),
             )
             conn.commit()
             st.session_state["active_campaign_id"] = campaign_id
+            st.session_state["run_campaign_selector"] = campaign_id
+            st.session_state["lead_campaign_selector"] = campaign_id
             st.success("Campaign configuration saved.")
 
     campaigns = load_campaigns()
@@ -599,13 +788,13 @@ with tabs[1]:
                 conn.executemany(
                     """
                     INSERT INTO leads
-                    (id, campaign_id, company, website, company_type, company_country,
+                    (id, campaign_id, company, website, company_type, industry, company_country,
                      contact_name, title, contact_country, email, company_score, contact_score,
                      qualification, reason, email1_subject, email1_body, email2_subject,
                      email2_body, email3_subject, email3_body, review_status,
                      company_cms, department, seniority)
                     VALUES
-                    (:id, :campaign_id, :company, :website, :company_type, :company_country,
+                    (:id, :campaign_id, :company, :website, :company_type, :industry, :company_country,
                      :contact_name, :title, :contact_country, :email, :company_score, :contact_score,
                      :qualification, :reason, :email1_subject, :email1_body, :email2_subject,
                      :email2_body, :email3_subject, :email3_body, :review_status,
@@ -622,20 +811,20 @@ with tabs[1]:
                 (new_status, run_campaign_id),
             )
             conn.commit()
+            # Keep the Leads tab aligned with the campaign that was just researched.
+            st.session_state["lead_campaign_selector"] = run_campaign_id
 
             qualified_count = sum(
                 record["qualification"] == "Qualified" for record in records
             )
-            if records:
-                st.success(
-                    f"Mock research complete: {len(records)} matching contacts found; "
-                    f"{qualified_count} passed the ICP score threshold."
-                )
-            else:
-                st.warning(
-                    "No sample records matched all selected filters. Try broadening one or "
-                    "more filters. No Clay search was performed."
-                )
+            st.session_state["last_research_notice"] = {
+                "found": bool(records),
+                "count": len(records),
+                "qualified_count": qualified_count,
+                "diagnostics": (
+                    mock_research_diagnostics(campaign) if not records else []
+                ),
+            }
             st.rerun()
 
 with tabs[2]:
@@ -668,13 +857,28 @@ with tabs[2]:
             )
 
             visible_columns = [
-                "company", "industry" if "industry" in leads.columns else "company_type",
-                "company_cms", "contact_name", "title", "department", "seniority",
+                "company", "company_type", "industry", "company_cms",
+                "contact_name", "title", "department", "seniority",
                 "company_country", "contact_country", "company_score", "contact_score",
                 "qualification",
             ]
+            lead_display_labels = {
+                "company": "Company Name",
+                "company_type": "Company Type",
+                "industry": "Industry",
+                "company_cms": "Current CMS",
+                "contact_name": "Contact Name",
+                "title": "Job Title",
+                "department": "Department",
+                "seniority": "Seniority",
+                "company_country": "Company Country",
+                "contact_country": "Contact Country",
+                "company_score": "Company ICP Score",
+                "contact_score": "Contact ICP Score",
+                "qualification": "ICP Qualification",
+            }
             st.dataframe(
-                leads[visible_columns],
+                leads[visible_columns].rename(columns=lead_display_labels),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -700,6 +904,30 @@ with tabs[2]:
             )
             st.write("Reason:", row["reason"])
 
+            selected_campaign_row = conn.execute(
+                "SELECT * FROM campaigns WHERE id = ?", (selected_campaign_id,)
+            ).fetchone()
+            campaign_columns = [
+                item[1] for item in conn.execute("PRAGMA table_info(campaigns)").fetchall()
+            ]
+            selected_campaign = dict(zip(campaign_columns, selected_campaign_row))
+
+            with st.expander("Email Sequence Instructions"):
+                st.write(
+                    selected_campaign.get("email_sequence_instructions", "")
+                    or "No custom instructions were added to this campaign."
+                )
+
+            with st.expander("AI email-generation prompt preview (future Clay handoff)"):
+                st.caption(
+                    "This combines your campaign instructions with the selected contact's "
+                    "details. In Mock Mode it is only a preview; no AI or Clay request is made."
+                )
+                st.code(
+                    build_email_sequence_prompt(selected_campaign, row.to_dict()),
+                    language="text",
+                )
+
             for sequence_number in (1, 2, 3):
                 st.markdown(f"**Email {sequence_number}**")
                 st.text_input(
@@ -722,6 +950,10 @@ with tabs[2]:
                 conn.commit()
                 st.success("Marked as approved for review. No email has been sent.")
 
+            st.caption(
+                "The visible email drafts are mock examples. Custom instructions are saved "
+                "and included in the prompt preview, but are not applied by an AI model in Mock Mode."
+            )
             st.warning(
                 "This MVP uses fictional sample data. It does not connect to Clay, "
                 "enrich real records, or send emails."
