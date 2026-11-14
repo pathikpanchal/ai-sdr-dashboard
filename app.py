@@ -950,7 +950,7 @@ last_research_notice = st.session_state.pop("last_research_notice", None)
 if last_research_notice and active_page == "Campaigns":
     if last_research_notice["found"]:
         st.success(
-            f"Mock research complete: {last_research_notice['count']} matching contacts found; "
+            f"Campaign data build complete: {last_research_notice['count']} matching contacts found; "
             f"{last_research_notice['qualified_count']} passed the ICP score threshold."
         )
     else:
@@ -1266,10 +1266,46 @@ if active_page == "Campaigns":
             selected_owner = str(selected_row.get("campaign_owner", "Unassigned") or "Unassigned")
 
             st.divider()
-            action_title, edit_col, duplicate_col, delete_col = st.columns([3.4, 1.3, 1.55, 1.3])
+            action_title, build_col, edit_col, duplicate_col, delete_col = st.columns(
+                [2.5, 1.45, 1.15, 1.45, 1.2]
+            )
             with action_title:
                 st.markdown(f"#### Selected Campaign: {selected_name}")
             selected_permission = get_campaign_permission(selected_id)
+            with build_col:
+                if selected_permission in ("Owner", "Can Edit"):
+                    if st.button(
+                        "Build Campaign Data",
+                        key="selected_build_campaign_data",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        campaign_for_run = campaign_as_dict(selected_id)
+                        records = run_mock_research(campaign_for_run)
+                        new_status = insert_mock_research_results(selected_id, records)
+                        qualified_count = sum(
+                            record["qualification"] == "Qualified" for record in records
+                        )
+                        st.session_state["last_research_notice"] = {
+                            "found": bool(records),
+                            "count": len(records),
+                            "qualified_count": qualified_count,
+                            "diagnostics": (
+                                mock_research_diagnostics(campaign_for_run) if not records else []
+                            ),
+                        }
+                        log_activity(
+                            "Campaign data built",
+                            selected_id,
+                            selected_name,
+                            current_mock_user_name,
+                            f"{len(records)} sample contacts found; status: {new_status}.",
+                        )
+                        st.session_state["lead_campaign_selector"] = selected_id
+                        st.session_state["active_campaign_id"] = selected_id
+                        st.rerun()
+                else:
+                    st.caption("View Only")
             with edit_col:
                 if selected_permission in ("Owner", "Can Edit"):
                     if st.button("Edit Campaign", key="selected_edit_campaign", use_container_width=True):
@@ -1712,60 +1748,13 @@ if active_page == "Campaigns":
                     st.session_state["campaign_create_notice"] = "Campaign created successfully."
                     st.rerun()
 
-    # Keep the mock research runner available without a separate navigation tab.
-    campaigns_for_run = load_campaigns()
-    if not campaigns_for_run.empty:
-        campaigns_for_run = campaigns_for_run[
-            campaigns_for_run["id"].apply(
-                lambda campaign_id: get_campaign_permission(campaign_id) in ("Owner", "Can Edit")
-            )
-        ]
-    if not campaigns_for_run.empty:
-        with st.expander("Run Mock Research", expanded=False):
-            st.caption(
-                "This runs against fictional sample records only. It does not connect to Clay "
-                "or consume Clay credits."
-            )
-            run_ids = campaigns_for_run["id"].tolist()
-            if st.session_state.get("run_campaign_selector") not in run_ids:
-                st.session_state["run_campaign_selector"] = run_ids[0]
-            active_default = st.session_state.get("active_campaign_id")
-            default_index = run_ids.index(active_default) if active_default in run_ids else 0
-            run_campaign_id = st.selectbox(
-                "Select campaign to research",
-                run_ids,
-                index=default_index,
-                format_func=lambda item: campaign_label(item, campaigns_for_run),
-                key="run_campaign_selector",
-            )
-            if st.button("Start Simulated Research", type="primary", key="start_mock_research"):
-                campaign = campaign_as_dict(run_campaign_id)
-                records = run_mock_research(campaign)
-                new_status = insert_mock_research_results(run_campaign_id, records)
-                qualified_count = sum(record["qualification"] == "Qualified" for record in records)
-                st.session_state["last_research_notice"] = {
-                    "found": bool(records),
-                    "count": len(records),
-                    "qualified_count": qualified_count,
-                    "diagnostics": mock_research_diagnostics(campaign) if not records else [],
-                }
-                log_activity(
-                    "Mock research completed",
-                    run_campaign_id,
-                    campaign.get("name", ""),
-                    campaign.get("campaign_owner", "Unassigned"),
-                    f"{len(records)} sample contacts found; status: {new_status}.",
-                )
-                st.session_state["lead_campaign_selector"] = run_campaign_id
-                st.rerun()
-
 elif active_page == "Review & Approvals":
     st.subheader("Review & Approvals")
     st.caption("Review the sample contacts and email drafts associated with each campaign.")
     campaigns = load_campaigns()
     if campaigns.empty:
         if is_mock_admin:
-            st.info("Create a campaign and run Mock Research first.")
+            st.info("Create a campaign, select it, and click Build Campaign Data first.")
         else:
             st.info("No campaigns have been shared with this mock user.")
     else:
@@ -1787,7 +1776,7 @@ elif active_page == "Review & Approvals":
             params=(selected_campaign_id,),
         )
         if leads.empty:
-            st.info("No sample contacts yet. Run Mock Research from the Campaigns page.")
+            st.info("No sample contacts yet. Select a campaign and click Build Campaign Data on the Campaigns page.")
         else:
             metric1, metric2, metric3 = st.columns(3)
             metric1.metric("Matching Contacts", len(leads))
