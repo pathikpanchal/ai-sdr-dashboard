@@ -41,40 +41,30 @@ st.markdown(
 
     /* Hide only the native Share action where its accessible label is exposed.
        Keep Streamlit's star, edit/Codespace and theme actions visible. */
-    div[data-testid="stToolbarActionButton"]:has(button[aria-label="Share"]),
-    div[data-testid="stToolbarActionButton"]:has(button[title="Share"]),
-    div[data-testid="stToolbarActionButton"]:has(a[aria-label="Share"]),
-    div[data-testid="stToolbarActionButton"]:has(a[title="Share"]),
-    div.stToolbarActionButton:has(button[aria-label="Share"]),
-    div.stToolbarActionButton:has(button[title="Share"]) {
+    [data-testid="stToolbar"] button[aria-label*="share" i],
+    [data-testid="stToolbar"] button[title*="share" i],
+    [data-testid="stToolbar"] a[aria-label*="share" i],
+    [data-testid="stToolbar"] a[title*="share" i],
+    div[data-testid="stToolbarActionButton"]:has([aria-label*="share" i]),
+    div[data-testid="stToolbarActionButton"]:has([title*="share" i]),
+    div.stToolbarActionButton:has([aria-label*="share" i]),
+    div.stToolbarActionButton:has([title*="share" i]) {
         display: none !important;
-    }
-    div.st-key-toolbar_share_button {
-        position: fixed !important;
-        top: 0.12rem !important;
-        right: 12.5rem !important;
-        z-index: 1000001 !important;
-        width: auto !important;
-        margin: 0 !important;
-    }
-    div.st-key-toolbar_share_button button {
-        min-height: 1.85rem !important;
-        height: 1.85rem !important;
-        width: auto !important;
-        padding: 0 0.45rem !important;
-        border: 0 !important;
-        border-radius: 0.35rem !important;
-        background: transparent !important;
-        color: var(--text-color) !important;
-        font-size: 0.85rem !important;
-        font-weight: 500 !important;
-        box-shadow: none !important;
-    }
-    div.st-key-toolbar_share_button button:hover {
-        background: rgba(128, 128, 128, 0.12) !important;
     }
 
     /* Compact, content-sized Create Campaign action. */
+    div[role="dialog"] {
+        max-width: min(720px, 92vw) !important;
+    }
+    div[role="dialog"] [data-testid="stVerticalBlock"] {
+        gap: 0.55rem !important;
+    }
+    div[role="dialog"] button[kind="primaryFormSubmit"],
+    div[role="dialog"] button[kind="primary"] {
+        background: #5b35d5 !important;
+        border-color: #5b35d5 !important;
+        color: #ffffff !important;
+    }
     div.st-key-create_campaign_button button {
         min-height: 2rem !important;
         height: 2rem !important;
@@ -93,7 +83,12 @@ st.markdown(
     section[data-testid="stSidebar"] * {color: #f4f6fb;}
     section[data-testid="stSidebar"] [data-testid="stRadio"] label {padding: 0.45rem 0.55rem; border-radius: 0.5rem;}
     section[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {background: rgba(124, 92, 255, 0.22);}
-    div.stButton > button[kind="primary"] {background: #5b35d5; border-color: #5b35d5;}
+    div.stButton > button[kind="primary"],
+    div[data-testid="stFormSubmitButton"] button {
+        background: #5b35d5 !important;
+        border-color: #5b35d5 !important;
+        color: #ffffff !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -973,7 +968,7 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     st.divider()
-    st.markdown('<div class="mock-mode-badge">MOCK MODE — ON</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mock-mode-badge">TEST MODE</div>', unsafe_allow_html=True)
     st.divider()
     st.selectbox(
         "Switch Mock User",
@@ -987,203 +982,6 @@ with st.sidebar:
 current_mock_user_email = st.session_state.get("mock_user_email", "__admin__")
 current_mock_user_name = mock_user_labels.get(current_mock_user_email, "Workspace Admin")
 is_mock_admin = current_mock_user_email == "__admin__"
-
-@st.dialog("Share AI SDR Dashboard", width="small")
-def show_share_dialog():
-    st.caption("Manage workspace access. Permissions apply to all current and future campaigns.")
-
-    if is_mock_admin:
-        st.markdown("#### Invite people")
-        with st.form("header_share_invitation_form"):
-            share_name = st.text_input("Name", key="header_share_name")
-            share_email = st.text_input("Email address", key="header_share_email")
-            share_permission = st.selectbox(
-                "Permission",
-                ["View Only", "Can Edit"],
-                index=None,
-                placeholder="Select permission",
-                key="header_share_permission",
-            )
-            share_invite = st.form_submit_button("Send invite", type="primary", use_container_width=True)
-
-        if share_invite:
-            email_value = share_email.strip().lower()
-            if not share_name.strip():
-                st.error("Please enter the person's name.")
-            elif not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email_value):
-                st.error("Please enter a valid email address.")
-            elif not share_permission:
-                st.error("Please select View Only or Can Edit.")
-            elif not invitation_email_is_configured():
-                st.error("Invitation email is not configured. Set it up in Team & Access first.")
-            else:
-                invitation_token = pysecrets.token_urlsafe(32)
-                now = datetime.now()
-                now_text = now.isoformat(timespec="seconds")
-                expiry_text = (now + timedelta(days=7)).isoformat(timespec="seconds")
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO team_members (email, name, status, created_at)
-                        VALUES (?, ?, 'Pending', ?)
-                        ON CONFLICT(email) DO UPDATE SET name = excluded.name, status = 'Pending'
-                        """,
-                        (email_value, share_name.strip(), now_text),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO workspace_access
-                        (id, member_email, member_name, permission, invitation_token,
-                         invitation_status, invited_by, invited_at, expires_at, accepted_at, revoked_at)
-                        VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?, ?, NULL, NULL)
-                        ON CONFLICT(member_email) DO UPDATE SET
-                            member_name = excluded.member_name,
-                            permission = excluded.permission,
-                            invitation_token = excluded.invitation_token,
-                            invitation_status = 'Pending',
-                            invited_by = excluded.invited_by,
-                            invited_at = excluded.invited_at,
-                            expires_at = excluded.expires_at,
-                            accepted_at = NULL,
-                            revoked_at = NULL
-                        """,
-                        (
-                            str(uuid.uuid4()), email_value, share_name.strip(), share_permission,
-                            invitation_token, current_mock_user_name, now_text, expiry_text,
-                        ),
-                    )
-                    conn.commit()
-                    send_workspace_invitation_email(
-                        share_name.strip(), email_value, share_permission,
-                        current_mock_user_name, invitation_token
-                    )
-                    log_activity(
-                        "Workspace invitation sent",
-                        None,
-                        "Workspace",
-                        current_mock_user_name,
-                        f"Invitation sent to {email_value} with {share_permission} access to all campaigns.",
-                    )
-                    st.success(f"Invitation sent to {email_value}.")
-                    st.rerun()
-                except Exception as exc:
-                    conn.execute(
-                        "UPDATE workspace_access SET invitation_status = 'Email Failed', invitation_token = NULL WHERE member_email = ?",
-                        (email_value,),
-                    )
-                    conn.execute(
-                        "UPDATE team_members SET status = 'Inactive' WHERE email = ?",
-                        (email_value,),
-                    )
-                    conn.commit()
-                    st.error(f"Could not send the invitation: {exc}")
-
-        with st.expander("Manage existing access", expanded=False):
-            access_rows = conn.execute(
-                """
-                SELECT id, member_name, member_email, permission, invitation_status,
-                       invited_at, accepted_at
-                FROM workspace_access
-                ORDER BY invited_at DESC
-                """
-            ).fetchall()
-
-            if not access_rows:
-                st.info("No one has been invited yet.")
-            else:
-                for row in access_rows:
-                    access_id, member_name, member_email, current_permission, invitation_status, invited_at, accepted_at = row
-                    with st.container(border=True):
-                        name_col, email_col = st.columns([1, 1.7])
-                        name_col.write(f"**{member_name}**")
-                        email_col.write(member_email)
-                        permission_col, status_col = st.columns([1, 1])
-                        with permission_col:
-                            new_permission = st.selectbox(
-                                "Access",
-                                ["View Only", "Can Edit"],
-                                index=["View Only", "Can Edit"].index(current_permission),
-                                key=f"header_share_permission_{access_id}",
-                            )
-                        status_col.write(f"**Status:** {invitation_status}")
-                        action_col, revoke_col = st.columns([1, 1])
-                        with action_col:
-                            if st.button("Save access", key=f"header_share_save_{access_id}"):
-                                conn.execute(
-                                    "UPDATE workspace_access SET permission = ? WHERE id = ?",
-                                    (new_permission, access_id),
-                                )
-                                conn.commit()
-                                if invitation_status == "Pending":
-                                    latest = conn.execute(
-                                        """
-                                        SELECT invitation_token, member_name, member_email, invited_by
-                                        FROM workspace_access WHERE id = ?
-                                        """,
-                                        (access_id,),
-                                    ).fetchone()
-                                    try:
-                                        send_workspace_invitation_email(
-                                            latest[1], latest[2], new_permission, latest[3], latest[0]
-                                        )
-                                        st.success("Permission updated and revised invitation sent.")
-                                    except Exception as exc:
-                                        st.error(f"Permission updated, but revised email could not be sent: {exc}")
-                                else:
-                                    st.success("Permission updated for all campaigns.")
-                                st.rerun()
-                        with revoke_col:
-                            if invitation_status != "Revoked":
-                                if st.button("Revoke access", key=f"header_share_revoke_{access_id}"):
-                                    now_text = datetime.now().isoformat(timespec="seconds")
-                                    conn.execute(
-                                        """
-                                        UPDATE workspace_access
-                                        SET invitation_status = 'Revoked',
-                                            invitation_token = NULL,
-                                            revoked_at = ?
-                                        WHERE id = ?
-                                        """,
-                                        (now_text, access_id),
-                                    )
-                                    conn.execute(
-                                        "UPDATE team_members SET status = 'Inactive' WHERE email = ?",
-                                        (member_email,),
-                                    )
-                                    conn.commit()
-                                    log_activity(
-                                        "Workspace access revoked",
-                                        None,
-                                        "Workspace",
-                                        current_mock_user_name,
-                                        f"Revoked all-campaign access for {member_email}.",
-                                    )
-                                    st.success(f"Access revoked for {member_email}.")
-                                    st.rerun()
-                        st.caption(
-                            f"Invited: {format_created_date(invited_at)}"
-                            + (f" · Accepted: {format_created_date(accepted_at)}" if accepted_at else "")
-                        )
-    else:
-        current_access = conn.execute(
-            """
-            SELECT permission, invitation_status
-            FROM workspace_access WHERE member_email = ?
-            """,
-            (current_mock_user_email,),
-        ).fetchone()
-        if current_access and current_access[1] == "Accepted":
-            st.write(f"**Your access:** {current_access[0]}")
-            st.caption("This permission applies across all campaigns.")
-        else:
-            st.info("You do not have active workspace access.")
-
-    if st.button("Open full Team & Access settings", key="header_open_team_access"):
-        st.session_state["main_navigation"] = "Team & Access"
-        st.rerun()
-
-
-
 
 previous_mock_identity = st.session_state.get("_previous_mock_user_email", current_mock_user_email)
 if previous_mock_identity != current_mock_user_email:
@@ -1415,9 +1213,9 @@ def render_invitation_acceptance():
 render_invitation_acceptance()
 
 
-@st.dialog("Create New Campaign", width="large")
+@st.dialog("Create New Campaign", width="small")
 def show_create_campaign_dialog():
-    st.caption("Add a campaign name. All targeting filters are optional; leave any field blank to skip it.")
+    st.caption("* Required fields. Leave any other field blank if it is not relevant to this campaign.")
 
     with st.form("create_campaign_dialog_form"):
         name_col, owner_col = st.columns(2)
@@ -1429,49 +1227,51 @@ def show_create_campaign_dialog():
             )
         with owner_col:
             campaign_owner = st.text_input(
-                "Campaign Owner (optional)",
+                "Campaign Owner *",
                 value="",
                 placeholder="Owner's name",
             )
 
-        industry_col, company_country_col, contact_country_col = st.columns(3)
+        industry_col, company_country_col = st.columns(2)
         with industry_col:
-            industry = st.text_input("Industry (optional)", value="", placeholder="e.g. Pharmaceuticals")
+            industry = st.text_input("Industry", value="", placeholder="e.g. Pharmaceuticals")
         with company_country_col:
-            company_country = st.text_input("Company Country (optional)", value="", placeholder="e.g. United Kingdom")
-        with contact_country_col:
-            contact_country = st.text_input("Contact Country (optional)", value="", placeholder="e.g. United Kingdom")
+            company_country = st.text_input("Company Country", value="", placeholder="e.g. United Kingdom")
 
-        department_col, titles_col, cms_col = st.columns(3)
+        contact_country_col, department_col = st.columns(2)
+        with contact_country_col:
+            contact_country = st.text_input("Contact Country", value="", placeholder="e.g. United Kingdom")
         with department_col:
-            department = st.text_input("Department (optional)", value="", placeholder="e.g. Marketing")
+            department = st.text_input("Department", value="", placeholder="e.g. Marketing")
+
+        titles_col, cms_col = st.columns(2)
         with titles_col:
             target_titles = st.text_input(
-                "Job Titles (optional)",
+                "Job Titles",
                 value="",
                 placeholder="e.g. CMO, Marketing Director",
                 help="Enter multiple titles separated by commas. Leave blank for any job title.",
             )
         with cms_col:
-            current_cms = st.text_input("Current CMS (optional)", value="", placeholder="e.g. WordPress")
+            current_cms = st.text_input("Current CMS", value="", placeholder="e.g. WordPress")
 
-        seniority_col, job_level_col, threshold_col = st.columns([1.2, 1, 1])
+        seniority_col, job_level_col = st.columns(2)
         with seniority_col:
-            seniority = st.multiselect("Seniority (optional)", SENIORITY_OPTIONS, default=[])
+            seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=[])
         with job_level_col:
             job_level = st.selectbox(
-                "Job Level (optional)",
+                "Job Level",
                 JOB_LEVEL_OPTIONS,
                 index=JOB_LEVEL_OPTIONS.index("Any"),
             )
-        with threshold_col:
-            threshold = st.slider(
-                "Minimum ICP score (optional)",
-                min_value=0,
-                max_value=100,
-                value=0,
-                help="0 means no minimum score filter.",
-            )
+
+        threshold = st.slider(
+            "Minimum ICP score",
+            min_value=0,
+            max_value=100,
+            value=0,
+            help="0 means no minimum score filter.",
+        )
 
         with st.expander("Additional options (optional)", expanded=False):
             clay_table_url = st.text_input(
@@ -1489,11 +1289,11 @@ def show_create_campaign_dialog():
         submitted = st.form_submit_button("Create Campaign", type="primary", use_container_width=True)
 
     if submitted:
-        if not campaign_name.strip():
-            st.error("Campaign Name is required. All targeting filters are optional.")
+        if not campaign_name.strip() or not campaign_owner.strip():
+            st.error("Please complete both required fields: Campaign Name and Campaign Owner.")
         else:
             campaign_id = str(uuid.uuid4())
-            owner_value = campaign_owner.strip() or "Unassigned"
+            owner_value = campaign_owner.strip()
             conn.execute(
                 """
                 INSERT INTO campaigns
@@ -1532,10 +1332,7 @@ def show_create_campaign_dialog():
             st.rerun()
 
 
-# Single Share control, positioned where Streamlit's native Share action appears.
-if st.button("Share", key="toolbar_share_button", type="secondary"):
-    show_share_dialog()
-
+# Share controls are intentionally removed from the top toolbar.
 st.title("AI SDR Dashboard")
 
 
