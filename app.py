@@ -26,25 +26,47 @@ st.markdown(
         margin-top: 0 !important;
     }
     [data-testid="stHeader"] {
-        height: 2.25rem !important;
-        min-height: 2.25rem !important;
+        height: 1.5rem !important;
+        min-height: 1.5rem !important;
     }
     h1 {margin-top: 0 !important; padding-top: 0 !important;}
-    div.st-key-toolbar_access_button {
+    /* Hide only Streamlit's native Share action; keep star, edit and theme controls. */
+    [data-testid="stToolbar"] button[aria-label="Share"] {
+        display: none !important;
+    }
+    div.st-key-toolbar_share_button {
         position: fixed !important;
-        top: 0.25rem !important;
-        right: 8.25rem !important;
-        z-index: 1000000 !important;
+        top: 0.12rem !important;
+        right: 10.8rem !important;
+        z-index: 1000001 !important;
         width: auto !important;
     }
-    div.st-key-toolbar_access_button button {
+    div.st-key-toolbar_share_button button {
         min-height: 2rem !important;
         height: 2rem !important;
-        padding: 0 0.65rem !important;
-        border: 1px solid rgba(128, 128, 128, 0.35) !important;
-        background: var(--secondary-background-color) !important;
+        padding: 0 0.45rem !important;
+        border: 0 !important;
+        background: transparent !important;
         color: var(--text-color) !important;
-        font-size: 0.85rem !important;
+        font-size: 0.9rem !important;
+        font-weight: 400 !important;
+    }
+    div.st-key-toolbar_share_button button:hover {
+        background: rgba(128, 128, 128, 0.12) !important;
+    }
+    div.st-key-create_campaign_button button {
+        min-height: 2.35rem !important;
+        height: 2.35rem !important;
+        padding: 0.35rem 0.7rem !important;
+        font-size: 0.9rem !important;
+        font-weight: 600 !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stAlert"] {
+        background: transparent !important;
+        border: 1px solid rgba(255,255,255,0.45) !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stAlert"] * {
+        color: #ffffff !important;
     }
     [data-testid="stMetricValue"] {font-size: 1.8rem;}
     [data-testid="stMetricLabel"] {font-size: 0.95rem;}
@@ -926,7 +948,6 @@ if st.session_state.get("mock_user_email", "__admin__") not in mock_user_labels:
 
 with st.sidebar:
     st.markdown("## AI SDR Dashboard")
-    st.caption("Phase I workspace")
     st.divider()
     active_page = st.radio(
         "Workspace",
@@ -936,7 +957,6 @@ with st.sidebar:
     )
     st.divider()
     st.success("MOCK MODE — ON")
-    st.caption("Fictional sample data only. Clay is not connected.")
     st.divider()
     st.selectbox(
         "Switch Mock User",
@@ -1379,9 +1399,9 @@ def render_invitation_acceptance():
 
 render_invitation_acceptance()
 
-# This app-owned control is visually positioned beside Streamlit's native Share toolbar.
-# Streamlit does not expose a supported API for adding custom items inside its native toolbar.
-if st.button("Access", key="toolbar_access_button", type="secondary"):
+# App-owned Share control replaces Streamlit's native Share action.
+# The native Share action only shares the app URL; this dialog manages workspace permissions.
+if st.button("Share", key="toolbar_share_button", type="secondary"):
     show_share_dialog()
 
 st.title("AI SDR Dashboard")
@@ -1394,7 +1414,7 @@ if active_page == "Campaigns":
         st.caption("Manage campaigns, review their criteria, and open the linked Clay table.")
     with create_col:
         if is_mock_admin:
-            if st.button("＋ Create Campaign", type="primary", use_container_width=True):
+            if st.button("＋ Create Campaign", key="create_campaign_button", type="primary", use_container_width=True):
                 st.session_state["show_create_campaign_form"] = True
                 st.session_state["editing_campaign_id"] = None
                 st.rerun()
@@ -1851,27 +1871,41 @@ if active_page == "Campaigns":
                     st.rerun()
 
             with st.form("create_campaign_form"):
-                campaign_name = st.text_input(
-                    "Campaign Name",
-                    value="UK Pharmaceutical Marketing Decision Makers",
-                )
-                campaign_owner = st.text_input(
-                    "Campaign Owner",
-                    value="",
-                    placeholder="Enter SDR or campaign owner's name",
-                )
-                industry = st.text_input("Industry", value="Pharmaceuticals")
-                company_country = st.text_input("Company Country", value="United Kingdom")
-                contact_country = st.text_input("Contact Country", value="United Kingdom")
-                target_titles = st.text_input(
-                    "Job Titles",
-                    value="",
-                    placeholder="e.g. CMO, Marketing Director, Head of Marketing",
-                    help="Enter multiple titles separated by commas. Blank means any job title.",
-                )
-                current_cms = st.text_input("Current CMS", value="", placeholder="e.g. WordPress, Drupal, Sitecore")
-                department = st.text_input("Department", value="Marketing", placeholder="e.g. Marketing, Sales")
-                seniority_col, job_level_col = st.columns(2)
+                name_col, owner_col = st.columns(2)
+                with name_col:
+                    campaign_name = st.text_input(
+                        "Campaign Name",
+                        value="UK Pharmaceutical Marketing Decision Makers",
+                    )
+                with owner_col:
+                    campaign_owner = st.text_input(
+                        "Campaign Owner",
+                        value="",
+                        placeholder="Enter SDR or campaign owner's name",
+                    )
+
+                industry_col, company_country_col, contact_country_col = st.columns(3)
+                with industry_col:
+                    industry = st.text_input("Industry", value="Pharmaceuticals")
+                with company_country_col:
+                    company_country = st.text_input("Company Country", value="United Kingdom")
+                with contact_country_col:
+                    contact_country = st.text_input("Contact Country", value="United Kingdom")
+
+                titles_col, cms_col, department_col = st.columns(3)
+                with titles_col:
+                    target_titles = st.text_input(
+                        "Job Titles",
+                        value="",
+                        placeholder="e.g. CMO, Marketing Director",
+                        help="Enter multiple titles separated by commas. Blank means any job title.",
+                    )
+                with cms_col:
+                    current_cms = st.text_input("Current CMS", value="", placeholder="WordPress, Drupal")
+                with department_col:
+                    department = st.text_input("Department", value="Marketing", placeholder="Marketing, Sales")
+
+                seniority_col, job_level_col, threshold_col = st.columns([1.3, 1, 1])
                 with seniority_col:
                     seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=["Manager"])
                 with job_level_col:
@@ -1880,6 +1914,14 @@ if active_page == "Campaigns":
                         JOB_LEVEL_OPTIONS,
                         index=JOB_LEVEL_OPTIONS.index("Above"),
                     )
+                with threshold_col:
+                    threshold = st.slider(
+                        "Minimum ICP score",
+                        min_value=0,
+                        max_value=100,
+                        value=75,
+                    )
+
                 clay_table_url = st.text_input(
                     "Clay Table Link (optional)",
                     value="",
@@ -1896,12 +1938,6 @@ if active_page == "Campaigns":
                         "Avoid: Generic claims, exaggerated promises, and unsupported facts."
                     ),
                     height=150,
-                )
-                threshold = st.slider(
-                    "Minimum company and contact ICP score",
-                    min_value=0,
-                    max_value=100,
-                    value=75,
                 )
                 submitted = st.form_submit_button("Save Campaign", type="primary")
 
