@@ -20,6 +20,11 @@ st.set_page_config(page_title="AI SDR Dashboard", page_icon="🎯", layout="wide
 st.markdown(
     """
     <style>
+    [data-testid="stAppViewContainer"] .main .block-container {
+        padding-top: 1.35rem;
+        padding-bottom: 2rem;
+    }
+    h1 {margin-top: 0.15rem; padding-top: 0;}
     [data-testid="stMetricValue"] {font-size: 1.8rem;}
     [data-testid="stMetricLabel"] {font-size: 0.95rem;}
     div[data-testid="stMarkdownContainer"] p {font-size: 1rem; line-height: 1.45;}
@@ -877,9 +882,6 @@ def format_created_date(value):
         return str(value)[:10]
 
 
-st.title("AI SDR Dashboard")
-st.caption("Phase I MVP · Mock Mode · No Clay API calls or Clay credits used · Team invitations use configured email")
-
 NAV_ITEMS = [
     "Campaigns",
     "Review & Approvals",
@@ -928,6 +930,204 @@ current_mock_user_email = st.session_state.get("mock_user_email", "__admin__")
 current_mock_user_name = mock_user_labels.get(current_mock_user_email, "Workspace Admin")
 is_mock_admin = current_mock_user_email == "__admin__"
 
+@st.dialog("Share AI SDR Dashboard", width="large")
+def show_share_dialog():
+    st.caption("Manage workspace access. Permissions apply to all current and future campaigns.")
+
+    if is_mock_admin:
+        st.markdown("#### Invite people")
+        with st.form("header_share_invitation_form"):
+            share_name = st.text_input("Name", key="header_share_name")
+            share_email = st.text_input("Email address", key="header_share_email")
+            share_permission = st.selectbox(
+                "Permission",
+                ["View Only", "Can Edit"],
+                index=None,
+                placeholder="Select permission",
+                key="header_share_permission",
+            )
+            share_invite = st.form_submit_button("Send invitation", type="primary")
+
+        if share_invite:
+            email_value = share_email.strip().lower()
+            if not share_name.strip():
+                st.error("Please enter the person's name.")
+            elif not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email_value):
+                st.error("Please enter a valid email address.")
+            elif not share_permission:
+                st.error("Please select View Only or Can Edit.")
+            elif not invitation_email_is_configured():
+                st.error("Invitation email is not configured. Set it up in Team & Access first.")
+            else:
+                invitation_token = pysecrets.token_urlsafe(32)
+                now = datetime.now()
+                now_text = now.isoformat(timespec="seconds")
+                expiry_text = (now + timedelta(days=7)).isoformat(timespec="seconds")
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO team_members (email, name, status, created_at)
+                        VALUES (?, ?, 'Pending', ?)
+                        ON CONFLICT(email) DO UPDATE SET name = excluded.name, status = 'Pending'
+                        """,
+                        (email_value, share_name.strip(), now_text),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO workspace_access
+                        (id, member_email, member_name, permission, invitation_token,
+                         invitation_status, invited_by, invited_at, expires_at, accepted_at, revoked_at)
+                        VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?, ?, NULL, NULL)
+                        ON CONFLICT(member_email) DO UPDATE SET
+                            member_name = excluded.member_name,
+                            permission = excluded.permission,
+                            invitation_token = excluded.invitation_token,
+                            invitation_status = 'Pending',
+                            invited_by = excluded.invited_by,
+                            invited_at = excluded.invited_at,
+                            expires_at = excluded.expires_at,
+                            accepted_at = NULL,
+                            revoked_at = NULL
+                        """,
+                        (
+                            str(uuid.uuid4()), email_value, share_name.strip(), share_permission,
+                            invitation_token, current_mock_user_name, now_text, expiry_text,
+                        ),
+                    )
+                    conn.commit()
+                    send_workspace_invitation_email(
+                        share_name.strip(), email_value, share_permission,
+                        current_mock_user_name, invitation_token
+                    )
+                    log_activity(
+                        "Workspace invitation sent",
+                        None,
+                        "Workspace",
+                        current_mock_user_name,
+                        f"Invitation sent to {email_value} with {share_permission} access to all campaigns.",
+                    )
+                    st.success(f"Invitation sent to {email_value}.")
+                    st.rerun()
+                except Exception as exc:
+                    conn.execute(
+                        "UPDATE workspace_access SET invitation_status = 'Email Failed', invitation_token = NULL WHERE member_email = ?",
+                        (email_value,),
+                    )
+                    conn.execute(
+                        "UPDATE team_members SET status = 'Inactive' WHERE email = ?",
+                        (email_value,),
+                    )
+                    conn.commit()
+                    st.error(f"Could not send the invitation: {exc}")
+
+        st.divider()
+        st.markdown("#### People with access")
+        access_rows = conn.execute(
+            """
+            SELECT id, member_name, member_email, permission, invitation_status,
+                   invited_at, accepted_at
+            FROM workspace_access
+            ORDER BY invited_at DESC
+            """
+        ).fetchall()
+
+        if not access_rows:
+            st.info("No one has been invited yet.")
+        else:
+            for row in access_rows:
+                access_id, member_name, member_email, current_permission, invitation_status, invited_at, accepted_at = row
+                with st.container(border=True):
+                    name_col, email_col = st.columns([1, 1.7])
+                    name_col.write(f"**{member_name}**")
+                    email_col.write(member_email)
+                    permission_col, status_col = st.columns([1, 1])
+                    with permission_col:
+                        new_permission = st.selectbox(
+                            "Access",
+                            ["View Only", "Can Edit"],
+                            index=["View Only", "Can Edit"].index(current_permission),
+                            key=f"header_share_permission_{access_id}",
+                        )
+                    status_col.write(f"**Status:** {invitation_status}")
+                    action_col, revoke_col = st.columns([1, 1])
+                    with action_col:
+                        if st.button("Save access", key=f"header_share_save_{access_id}"):
+                            conn.execute(
+                                "UPDATE workspace_access SET permission = ? WHERE id = ?",
+                                (new_permission, access_id),
+                            )
+                            conn.commit()
+                            if invitation_status == "Pending":
+                                latest = conn.execute(
+                                    """
+                                    SELECT invitation_token, member_name, member_email, invited_by
+                                    FROM workspace_access WHERE id = ?
+                                    """,
+                                    (access_id,),
+                                ).fetchone()
+                                try:
+                                    send_workspace_invitation_email(
+                                        latest[1], latest[2], new_permission, latest[3], latest[0]
+                                    )
+                                    st.success("Permission updated and revised invitation sent.")
+                                except Exception as exc:
+                                    st.error(f"Permission updated, but revised email could not be sent: {exc}")
+                            else:
+                                st.success("Permission updated for all campaigns.")
+                            st.rerun()
+                    with revoke_col:
+                        if invitation_status != "Revoked":
+                            if st.button("Revoke access", key=f"header_share_revoke_{access_id}"):
+                                now_text = datetime.now().isoformat(timespec="seconds")
+                                conn.execute(
+                                    """
+                                    UPDATE workspace_access
+                                    SET invitation_status = 'Revoked',
+                                        invitation_token = NULL,
+                                        revoked_at = ?
+                                    WHERE id = ?
+                                    """,
+                                    (now_text, access_id),
+                                )
+                                conn.execute(
+                                    "UPDATE team_members SET status = 'Inactive' WHERE email = ?",
+                                    (member_email,),
+                                )
+                                conn.commit()
+                                log_activity(
+                                    "Workspace access revoked",
+                                    None,
+                                    "Workspace",
+                                    current_mock_user_name,
+                                    f"Revoked all-campaign access for {member_email}.",
+                                )
+                                st.success(f"Access revoked for {member_email}.")
+                                st.rerun()
+                    st.caption(
+                        f"Invited: {format_created_date(invited_at)}"
+                        + (f" · Accepted: {format_created_date(accepted_at)}" if accepted_at else "")
+                    )
+    else:
+        current_access = conn.execute(
+            """
+            SELECT permission, invitation_status
+            FROM workspace_access WHERE member_email = ?
+            """,
+            (current_mock_user_email,),
+        ).fetchone()
+        if current_access and current_access[1] == "Accepted":
+            st.write(f"**Your access:** {current_access[0]}")
+            st.caption("This permission applies across all campaigns.")
+        else:
+            st.info("You do not have active workspace access.")
+
+    if st.button("Open full Team & Access settings", key="header_open_team_access"):
+        st.session_state["main_navigation"] = "Team & Access"
+        st.rerun()
+
+
+
+
 previous_mock_identity = st.session_state.get("_previous_mock_user_email", current_mock_user_email)
 if previous_mock_identity != current_mock_user_email:
     for state_key in (
@@ -950,7 +1150,7 @@ last_research_notice = st.session_state.pop("last_research_notice", None)
 if last_research_notice and active_page == "Campaigns":
     if last_research_notice["found"]:
         st.success(
-            f"Campaign data build complete: {last_research_notice['count']} matching contacts found; "
+            f"Mock research complete: {last_research_notice['count']} matching contacts found; "
             f"{last_research_notice['qualified_count']} passed the ICP score threshold."
         )
     else:
@@ -1158,6 +1358,14 @@ def render_invitation_acceptance():
 
 render_invitation_acceptance()
 
+header_title_col, header_share_col = st.columns([5.5, 1.2], vertical_alignment="center")
+with header_title_col:
+    st.title("AI SDR Dashboard")
+with header_share_col:
+    if st.button("Share / Access", use_container_width=True, type="secondary"):
+        show_share_dialog()
+
+
 if active_page == "Campaigns":
     heading_col, create_col = st.columns([5.5, 1.5])
     with heading_col:
@@ -1266,46 +1474,10 @@ if active_page == "Campaigns":
             selected_owner = str(selected_row.get("campaign_owner", "Unassigned") or "Unassigned")
 
             st.divider()
-            action_title, build_col, edit_col, duplicate_col, delete_col = st.columns(
-                [2.5, 1.45, 1.15, 1.45, 1.2]
-            )
+            action_title, edit_col, duplicate_col, delete_col = st.columns([3.4, 1.3, 1.55, 1.3])
             with action_title:
                 st.markdown(f"#### Selected Campaign: {selected_name}")
             selected_permission = get_campaign_permission(selected_id)
-            with build_col:
-                if selected_permission in ("Owner", "Can Edit"):
-                    if st.button(
-                        "Build Campaign Data",
-                        key="selected_build_campaign_data",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                        campaign_for_run = campaign_as_dict(selected_id)
-                        records = run_mock_research(campaign_for_run)
-                        new_status = insert_mock_research_results(selected_id, records)
-                        qualified_count = sum(
-                            record["qualification"] == "Qualified" for record in records
-                        )
-                        st.session_state["last_research_notice"] = {
-                            "found": bool(records),
-                            "count": len(records),
-                            "qualified_count": qualified_count,
-                            "diagnostics": (
-                                mock_research_diagnostics(campaign_for_run) if not records else []
-                            ),
-                        }
-                        log_activity(
-                            "Campaign data built",
-                            selected_id,
-                            selected_name,
-                            current_mock_user_name,
-                            f"{len(records)} sample contacts found; status: {new_status}.",
-                        )
-                        st.session_state["lead_campaign_selector"] = selected_id
-                        st.session_state["active_campaign_id"] = selected_id
-                        st.rerun()
-                else:
-                    st.caption("View Only")
             with edit_col:
                 if selected_permission in ("Owner", "Can Edit"):
                     if st.button("Edit Campaign", key="selected_edit_campaign", use_container_width=True):
@@ -1748,13 +1920,60 @@ if active_page == "Campaigns":
                     st.session_state["campaign_create_notice"] = "Campaign created successfully."
                     st.rerun()
 
+    # Keep the mock research runner available without a separate navigation tab.
+    campaigns_for_run = load_campaigns()
+    if not campaigns_for_run.empty:
+        campaigns_for_run = campaigns_for_run[
+            campaigns_for_run["id"].apply(
+                lambda campaign_id: get_campaign_permission(campaign_id) in ("Owner", "Can Edit")
+            )
+        ]
+    if not campaigns_for_run.empty:
+        with st.expander("Run Mock Research", expanded=False):
+            st.caption(
+                "This runs against fictional sample records only. It does not connect to Clay "
+                "or consume Clay credits."
+            )
+            run_ids = campaigns_for_run["id"].tolist()
+            if st.session_state.get("run_campaign_selector") not in run_ids:
+                st.session_state["run_campaign_selector"] = run_ids[0]
+            active_default = st.session_state.get("active_campaign_id")
+            default_index = run_ids.index(active_default) if active_default in run_ids else 0
+            run_campaign_id = st.selectbox(
+                "Select campaign to research",
+                run_ids,
+                index=default_index,
+                format_func=lambda item: campaign_label(item, campaigns_for_run),
+                key="run_campaign_selector",
+            )
+            if st.button("Start Simulated Research", type="primary", key="start_mock_research"):
+                campaign = campaign_as_dict(run_campaign_id)
+                records = run_mock_research(campaign)
+                new_status = insert_mock_research_results(run_campaign_id, records)
+                qualified_count = sum(record["qualification"] == "Qualified" for record in records)
+                st.session_state["last_research_notice"] = {
+                    "found": bool(records),
+                    "count": len(records),
+                    "qualified_count": qualified_count,
+                    "diagnostics": mock_research_diagnostics(campaign) if not records else [],
+                }
+                log_activity(
+                    "Mock research completed",
+                    run_campaign_id,
+                    campaign.get("name", ""),
+                    campaign.get("campaign_owner", "Unassigned"),
+                    f"{len(records)} sample contacts found; status: {new_status}.",
+                )
+                st.session_state["lead_campaign_selector"] = run_campaign_id
+                st.rerun()
+
 elif active_page == "Review & Approvals":
     st.subheader("Review & Approvals")
     st.caption("Review the sample contacts and email drafts associated with each campaign.")
     campaigns = load_campaigns()
     if campaigns.empty:
         if is_mock_admin:
-            st.info("Create a campaign, select it, and click Build Campaign Data first.")
+            st.info("Create a campaign and run Mock Research first.")
         else:
             st.info("No campaigns have been shared with this mock user.")
     else:
@@ -1776,7 +1995,7 @@ elif active_page == "Review & Approvals":
             params=(selected_campaign_id,),
         )
         if leads.empty:
-            st.info("No sample contacts yet. Select a campaign and click Build Campaign Data on the Campaigns page.")
+            st.info("No sample contacts yet. Run Mock Research from the Campaigns page.")
         else:
             metric1, metric2, metric3 = st.columns(3)
             metric1.metric("Matching Contacts", len(leads))
