@@ -61,7 +61,10 @@ st.markdown(
     }
     div[role="dialog"] [data-testid="InputInstructions"],
     div[role="dialog"] [data-testid="stInputInstructions"],
-    div[role="dialog"] [aria-label="Press Enter to submit form"] {
+    div[role="dialog"] [aria-label*="Press Enter to submit form" i],
+    div[role="dialog"] [title*="Press Enter to submit form" i],
+    div[role="dialog"] [data-testid="InputInstructions"] *,
+    div[role="dialog"] [data-testid="stInputInstructions"] * {
         display: none !important;
         visibility: hidden !important;
     }
@@ -1223,7 +1226,7 @@ render_invitation_acceptance()
 def show_create_campaign_dialog():
     st.caption("* Required fields. Leave any other field blank if it is not relevant to this campaign.")
 
-    with st.form("create_campaign_dialog_form"):
+    with st.form("create_campaign_dialog_form", enter_to_submit=False):
         name_col, owner_col = st.columns(2)
         with name_col:
             campaign_name = st.text_input(
