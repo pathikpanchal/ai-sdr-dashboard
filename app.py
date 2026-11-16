@@ -59,6 +59,12 @@ st.markdown(
     div[role="dialog"] [data-testid="stVerticalBlock"] {
         gap: 0.55rem !important;
     }
+    div[role="dialog"] [data-testid="InputInstructions"],
+    div[role="dialog"] [data-testid="stInputInstructions"],
+    div[role="dialog"] [aria-label="Press Enter to submit form"] {
+        display: none !important;
+        visibility: hidden !important;
+    }
     div[role="dialog"] button[kind="primaryFormSubmit"],
     div[role="dialog"] button[kind="primary"] {
         background: #5b35d5 !important;
@@ -1223,37 +1229,34 @@ def show_create_campaign_dialog():
             campaign_name = st.text_input(
                 "Campaign Name *",
                 value="",
-                placeholder="Enter a campaign name",
             )
         with owner_col:
             campaign_owner = st.text_input(
                 "Campaign Owner *",
                 value="",
-                placeholder="Owner's name",
             )
 
         industry_col, company_country_col = st.columns(2)
         with industry_col:
-            industry = st.text_input("Industry", value="", placeholder="e.g. Pharmaceuticals")
+            industry = st.text_input("Industry", value="")
         with company_country_col:
-            company_country = st.text_input("Company Country", value="", placeholder="e.g. United Kingdom")
+            company_country = st.text_input("Company Country", value="")
 
         contact_country_col, department_col = st.columns(2)
         with contact_country_col:
-            contact_country = st.text_input("Contact Country", value="", placeholder="e.g. United Kingdom")
+            contact_country = st.text_input("Contact Country", value="")
         with department_col:
-            department = st.text_input("Department", value="", placeholder="e.g. Marketing")
+            department = st.text_input("Department", value="")
 
         titles_col, cms_col = st.columns(2)
         with titles_col:
             target_titles = st.text_input(
                 "Job Titles",
                 value="",
-                placeholder="e.g. CMO, Marketing Director",
                 help="Enter multiple titles separated by commas. Leave blank for any job title.",
             )
         with cms_col:
-            current_cms = st.text_input("Current CMS", value="", placeholder="e.g. WordPress")
+            current_cms = st.text_input("Current CMS", value="")
 
         seniority_col, job_level_col = st.columns(2)
         with seniority_col:
@@ -1277,12 +1280,10 @@ def show_create_campaign_dialog():
             clay_table_url = st.text_input(
                 "Clay Table Link",
                 value="",
-                placeholder="Paste a Clay table URL if available",
             )
             email_sequence_instructions = st.text_area(
                 "Email Sequence Instructions",
                 value="",
-                placeholder="Add the campaign goal, audience, tone, personalization and CTA if needed.",
                 height=75,
             )
 
