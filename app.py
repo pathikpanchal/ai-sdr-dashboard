@@ -20,24 +20,17 @@ st.set_page_config(page_title="AI SDR Dashboard", page_icon="🎯", layout="wide
 st.markdown(
     """
     <style>
-    /* Pull the page content up directly below the Streamlit toolbar. */
+    /* Keep the page compact without placing the title underneath the fixed toolbar. */
     [data-testid="stAppViewContainer"] .main .block-container,
     [data-testid="stMainBlockContainer"],
-    .stMainBlockContainer,
-    section[data-testid="stMain"] > div,
-    section[data-testid="stMain"] div[data-testid="stMainBlockContainer"] {
-        padding-top: 0 !important;
-        padding-block-start: 0 !important;
+    .stMainBlockContainer {
+        padding-top: 1.8rem !important;
+        padding-bottom: 1.4rem !important;
         margin-top: 0 !important;
-    }
-    [data-testid="stMainBlockContainer"] > div:first-child,
-    .stMainBlockContainer > div:first-child {
-        margin-top: 0 !important;
-        padding-top: 0 !important;
     }
     [data-testid="stHeader"] {
-        height: 2.8rem !important;
-        min-height: 2.8rem !important;
+        height: 2.75rem !important;
+        min-height: 2.75rem !important;
     }
     h1 {
         margin-top: 0.1rem !important;
@@ -46,67 +39,52 @@ st.markdown(
         overflow: visible !important;
     }
 
-    /* Replace only the native Share action with our own permission-aware Share control.
-       Keep the native star, edit/Codespace and theme controls visible. */
-    div[data-testid="stToolbarActionButton"],
-    div.stToolbarActionButton {
+    /* Hide only the native Share action where its accessible label is exposed.
+       Keep Streamlit's star, edit/Codespace and theme actions visible. */
+    div[data-testid="stToolbarActionButton"]:has(button[aria-label="Share"]),
+    div[data-testid="stToolbarActionButton"]:has(button[title="Share"]),
+    div[data-testid="stToolbarActionButton"]:has(a[aria-label="Share"]),
+    div[data-testid="stToolbarActionButton"]:has(a[title="Share"]),
+    div.stToolbarActionButton:has(button[aria-label="Share"]),
+    div.stToolbarActionButton:has(button[title="Share"]) {
         display: none !important;
     }
     div.st-key-toolbar_share_button {
         position: fixed !important;
-        top: 0.08rem !important;
-        right: 4.45rem !important;
+        top: 0.12rem !important;
+        right: 12.5rem !important;
         z-index: 1000001 !important;
         width: auto !important;
         margin: 0 !important;
     }
     div.st-key-toolbar_share_button button {
-        min-height: 2rem !important;
-        height: 2rem !important;
+        min-height: 1.85rem !important;
+        height: 1.85rem !important;
         width: auto !important;
-        padding: 0 0.35rem !important;
+        padding: 0 0.45rem !important;
         border: 0 !important;
         border-radius: 0.35rem !important;
         background: transparent !important;
         color: var(--text-color) !important;
-        font-size: 0.9rem !important;
-        font-weight: 400 !important;
+        font-size: 0.85rem !important;
+        font-weight: 500 !important;
         box-shadow: none !important;
     }
     div.st-key-toolbar_share_button button:hover {
         background: rgba(128, 128, 128, 0.12) !important;
     }
 
-    /* Compact Create Campaign action. */
+    /* Compact, content-sized Create Campaign action. */
     div.st-key-create_campaign_button button {
-        min-height: 2.1rem !important;
-        height: 2.1rem !important;
+        min-height: 2rem !important;
+        height: 2rem !important;
         width: auto !important;
         min-width: 0 !important;
-        padding: 0.25rem 0.65rem !important;
+        padding: 0.2rem 0.6rem !important;
         font-size: 0.82rem !important;
         font-weight: 600 !important;
     }
 
-    /* High-contrast mock-mode label on the dark sidebar. */
-    .mock-mode-badge {
-        display: block;
-        width: 100%;
-        box-sizing: border-box;
-        padding: 0.72rem 0.55rem;
-        margin: 0.7rem 0;
-        border: 1px solid rgba(255,255,255,0.35);
-        border-radius: 0.55rem;
-        background: rgba(255,255,255,0.07);
-        color: #ffffff !important;
-        text-align: center;
-        font-size: 0.9rem;
-        font-weight: 600;
-        letter-spacing: 0.02em;
-    }
-    section[data-testid="stSidebar"] .mock-mode-badge {
-        color: #ffffff !important;
-    }
     [data-testid="stMetricValue"] {font-size: 1.8rem;}
     [data-testid="stMetricLabel"] {font-size: 0.95rem;}
     div[data-testid="stMarkdownContainer"] p {font-size: 1rem; line-height: 1.45;}
@@ -1215,7 +1193,6 @@ if previous_mock_identity != current_mock_user_email:
         "editing_campaign_id",
     ):
         st.session_state.pop(state_key, None)
-    st.session_state["show_create_campaign_form"] = False
     st.session_state.pop("overview_campaign", None)
     st.session_state["_reset_campaign_preview_widget"] = True
     st.session_state["_previous_mock_user_email"] = current_mock_user_email
@@ -1437,6 +1414,124 @@ def render_invitation_acceptance():
 
 render_invitation_acceptance()
 
+
+@st.dialog("Create New Campaign", width="large")
+def show_create_campaign_dialog():
+    st.caption("Add a campaign name. All targeting filters are optional; leave any field blank to skip it.")
+
+    with st.form("create_campaign_dialog_form"):
+        name_col, owner_col = st.columns(2)
+        with name_col:
+            campaign_name = st.text_input(
+                "Campaign Name *",
+                value="",
+                placeholder="Enter a campaign name",
+            )
+        with owner_col:
+            campaign_owner = st.text_input(
+                "Campaign Owner (optional)",
+                value="",
+                placeholder="Owner's name",
+            )
+
+        industry_col, company_country_col, contact_country_col = st.columns(3)
+        with industry_col:
+            industry = st.text_input("Industry (optional)", value="", placeholder="e.g. Pharmaceuticals")
+        with company_country_col:
+            company_country = st.text_input("Company Country (optional)", value="", placeholder="e.g. United Kingdom")
+        with contact_country_col:
+            contact_country = st.text_input("Contact Country (optional)", value="", placeholder="e.g. United Kingdom")
+
+        department_col, titles_col, cms_col = st.columns(3)
+        with department_col:
+            department = st.text_input("Department (optional)", value="", placeholder="e.g. Marketing")
+        with titles_col:
+            target_titles = st.text_input(
+                "Job Titles (optional)",
+                value="",
+                placeholder="e.g. CMO, Marketing Director",
+                help="Enter multiple titles separated by commas. Leave blank for any job title.",
+            )
+        with cms_col:
+            current_cms = st.text_input("Current CMS (optional)", value="", placeholder="e.g. WordPress")
+
+        seniority_col, job_level_col, threshold_col = st.columns([1.2, 1, 1])
+        with seniority_col:
+            seniority = st.multiselect("Seniority (optional)", SENIORITY_OPTIONS, default=[])
+        with job_level_col:
+            job_level = st.selectbox(
+                "Job Level (optional)",
+                JOB_LEVEL_OPTIONS,
+                index=JOB_LEVEL_OPTIONS.index("Any"),
+            )
+        with threshold_col:
+            threshold = st.slider(
+                "Minimum ICP score (optional)",
+                min_value=0,
+                max_value=100,
+                value=0,
+                help="0 means no minimum score filter.",
+            )
+
+        with st.expander("Additional options (optional)", expanded=False):
+            clay_table_url = st.text_input(
+                "Clay Table Link",
+                value="",
+                placeholder="Paste a Clay table URL if available",
+            )
+            email_sequence_instructions = st.text_area(
+                "Email Sequence Instructions",
+                value="",
+                placeholder="Add the campaign goal, audience, tone, personalization and CTA if needed.",
+                height=75,
+            )
+
+        submitted = st.form_submit_button("Create Campaign", type="primary", use_container_width=True)
+
+    if submitted:
+        if not campaign_name.strip():
+            st.error("Campaign Name is required. All targeting filters are optional.")
+        else:
+            campaign_id = str(uuid.uuid4())
+            owner_value = campaign_owner.strip() or "Unassigned"
+            conn.execute(
+                """
+                INSERT INTO campaigns
+                (id, name, industry, company_country, contact_country, target_titles,
+                 min_score, status, created_at, current_cms, department, seniority,
+                 job_level, email_sequence_instructions, clay_table_url, campaign_owner)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    campaign_id,
+                    campaign_name.strip(),
+                    industry.strip(),
+                    company_country.strip(),
+                    contact_country.strip(),
+                    target_titles.strip(),
+                    int(threshold),
+                    "Draft",
+                    datetime.now().isoformat(timespec="seconds"),
+                    current_cms.strip(),
+                    department.strip(),
+                    ", ".join(seniority),
+                    job_level,
+                    email_sequence_instructions.strip(),
+                    clay_table_url.strip(),
+                    owner_value,
+                ),
+            )
+            conn.commit()
+            log_activity("Campaign created", campaign_id, campaign_name.strip(), owner_value)
+            st.session_state.pop("overview_campaign", None)
+            st.session_state["_reset_campaign_preview_widget"] = True
+            st.session_state["active_campaign_id"] = campaign_id
+            st.session_state["run_campaign_selector"] = campaign_id
+            st.session_state["lead_campaign_selector"] = campaign_id
+            st.session_state["campaign_create_notice"] = "Campaign created successfully."
+            st.rerun()
+
+
 # Single Share control, positioned where Streamlit's native Share action appears.
 if st.button("Share", key="toolbar_share_button", type="secondary"):
     show_share_dialog()
@@ -1452,9 +1547,8 @@ if active_page == "Campaigns":
     with create_col:
         if is_mock_admin:
             if st.button("＋ Create Campaign", key="create_campaign_button", type="primary", use_container_width=False):
-                st.session_state["show_create_campaign_form"] = True
                 st.session_state["editing_campaign_id"] = None
-                st.rerun()
+                show_create_campaign_dialog()
 
     delete_notice = st.session_state.pop("campaign_delete_notice", None)
     if delete_notice:
@@ -1893,124 +1987,6 @@ if active_page == "Campaigns":
                 if st.button("Cancel Editing", key=f"cancel_campaign_editor_{selected_id}"):
                     st.session_state["editing_campaign_id"] = None
                     st.session_state.pop("campaign_edit_context", None)
-                    st.rerun()
-
-    # Campaign creation is opened from the Create Campaign button above.
-    if is_mock_admin and st.session_state.get("show_create_campaign_form"):
-        st.divider()
-        with st.container(border=True):
-            create_title_col, create_cancel_col = st.columns([5, 1])
-            with create_title_col:
-                st.markdown("#### Create New Campaign")
-            with create_cancel_col:
-                if st.button("Close", key="close_create_campaign_form"):
-                    st.session_state["show_create_campaign_form"] = False
-                    st.rerun()
-
-            with st.form("create_campaign_form"):
-                # Campaign name identifies the campaign; every targeting filter is optional.
-                name_col, owner_col = st.columns(2)
-                with name_col:
-                    campaign_name = st.text_input(
-                        "Campaign Name *",
-                        value="",
-                        placeholder="Enter a campaign name",
-                    )
-                with owner_col:
-                    campaign_owner = st.text_input(
-                        "Campaign Owner (optional)",
-                        value="",
-                        placeholder="Owner's name",
-                    )
-
-                industry_col, company_country_col = st.columns(2)
-                with industry_col:
-                    industry = st.text_input("Industry (optional)", value="", placeholder="e.g. Pharmaceuticals")
-                with company_country_col:
-                    company_country = st.text_input("Company Country (optional)", value="", placeholder="e.g. United Kingdom")
-
-                contact_country_col, department_col = st.columns(2)
-                with contact_country_col:
-                    contact_country = st.text_input("Contact Country (optional)", value="", placeholder="e.g. United Kingdom")
-                with department_col:
-                    department = st.text_input("Department (optional)", value="", placeholder="e.g. Marketing")
-
-                titles_col, cms_col = st.columns(2)
-                with titles_col:
-                    target_titles = st.text_input(
-                        "Job Titles (optional)",
-                        value="",
-                        placeholder="e.g. CMO, Marketing Director",
-                        help="Enter multiple titles separated by commas. Leave blank for any job title.",
-                    )
-                with cms_col:
-                    current_cms = st.text_input("Current CMS (optional)", value="", placeholder="e.g. WordPress, Drupal")
-
-                seniority_col, job_level_col, threshold_col = st.columns([1.25, 1, 1])
-                with seniority_col:
-                    seniority = st.multiselect("Seniority (optional)", SENIORITY_OPTIONS, default=[])
-                with job_level_col:
-                    job_level = st.selectbox(
-                        "Job Level (optional)",
-                        JOB_LEVEL_OPTIONS,
-                        index=JOB_LEVEL_OPTIONS.index("Any"),
-                    )
-                with threshold_col:
-                    threshold = st.slider(
-                        "Minimum ICP score (optional)",
-                        min_value=0,
-                        max_value=100,
-                        value=0,
-                        help="0 means no minimum score filter.",
-                    )
-
-                clay_table_url = st.text_input(
-                    "Clay Table Link (optional)",
-                    value="",
-                    placeholder="Paste a Clay table URL if available",
-                )
-                with st.expander("Email Sequence Instructions (optional)", expanded=False):
-                    email_sequence_instructions = st.text_area(
-                        "Instructions",
-                        value="",
-                        placeholder="Add goal, audience, tone, personalization and CTA instructions if needed.",
-                        height=65,
-                        label_visibility="collapsed",
-                    )
-                submitted = st.form_submit_button("Save Campaign", type="primary")
-
-            if submitted:
-                if not campaign_name.strip():
-                    st.error("Please enter a campaign name. All targeting filters are optional.")
-                else:
-                    campaign_id = str(uuid.uuid4())
-                    owner_value = campaign_owner.strip() or "Unassigned"
-                    conn.execute(
-                        """
-                        INSERT INTO campaigns
-                        (id, name, industry, company_country, contact_country, target_titles,
-                         min_score, status, created_at, current_cms, department, seniority,
-                         job_level, email_sequence_instructions, clay_table_url, campaign_owner)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            campaign_id, campaign_name.strip(), industry.strip(),
-                            company_country.strip(), contact_country.strip(), target_titles.strip(),
-                            int(threshold), "Draft", datetime.now().isoformat(timespec="seconds"),
-                            current_cms.strip(), department.strip(), ", ".join(seniority),
-                            job_level, email_sequence_instructions.strip(), clay_table_url.strip(),
-                            owner_value,
-                        ),
-                    )
-                    conn.commit()
-                    log_activity("Campaign created", campaign_id, campaign_name.strip(), owner_value)
-                    st.session_state.pop("overview_campaign", None)
-                    st.session_state["_reset_campaign_preview_widget"] = True
-                    st.session_state["active_campaign_id"] = campaign_id
-                    st.session_state["run_campaign_selector"] = campaign_id
-                    st.session_state["lead_campaign_selector"] = campaign_id
-                    st.session_state["show_create_campaign_form"] = False
-                    st.session_state["campaign_create_notice"] = "Campaign created successfully."
                     st.rerun()
 
     # Keep the mock research runner available without a separate navigation tab.
