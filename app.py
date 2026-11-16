@@ -21,10 +21,31 @@ st.markdown(
     """
     <style>
     [data-testid="stAppViewContainer"] .main .block-container {
-        padding-top: 1.35rem;
+        padding-top: 0.15rem !important;
         padding-bottom: 2rem;
+        margin-top: 0 !important;
     }
-    h1 {margin-top: 0.15rem; padding-top: 0;}
+    [data-testid="stHeader"] {
+        height: 2.25rem !important;
+        min-height: 2.25rem !important;
+    }
+    h1 {margin-top: 0 !important; padding-top: 0 !important;}
+    div.st-key-toolbar_access_button {
+        position: fixed !important;
+        top: 0.25rem !important;
+        right: 8.25rem !important;
+        z-index: 1000000 !important;
+        width: auto !important;
+    }
+    div.st-key-toolbar_access_button button {
+        min-height: 2rem !important;
+        height: 2rem !important;
+        padding: 0 0.65rem !important;
+        border: 1px solid rgba(128, 128, 128, 0.35) !important;
+        background: var(--secondary-background-color) !important;
+        color: var(--text-color) !important;
+        font-size: 0.85rem !important;
+    }
     [data-testid="stMetricValue"] {font-size: 1.8rem;}
     [data-testid="stMetricLabel"] {font-size: 0.95rem;}
     div[data-testid="stMarkdownContainer"] p {font-size: 1rem; line-height: 1.45;}
@@ -1358,12 +1379,12 @@ def render_invitation_acceptance():
 
 render_invitation_acceptance()
 
-header_title_col, header_share_col = st.columns([5.5, 1.2], vertical_alignment="center")
-with header_title_col:
-    st.title("AI SDR Dashboard")
-with header_share_col:
-    if st.button("Share / Access", use_container_width=True, type="secondary"):
-        show_share_dialog()
+# This app-owned control is visually positioned beside Streamlit's native Share toolbar.
+# Streamlit does not expose a supported API for adding custom items inside its native toolbar.
+if st.button("Access", key="toolbar_access_button", type="secondary"):
+    show_share_dialog()
+
+st.title("AI SDR Dashboard")
 
 
 if active_page == "Campaigns":
