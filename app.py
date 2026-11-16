@@ -20,52 +20,86 @@ st.set_page_config(page_title="AI SDR Dashboard", page_icon="🎯", layout="wide
 st.markdown(
     """
     <style>
-    [data-testid="stAppViewContainer"] .main .block-container {
-        padding-top: 0.15rem !important;
-        padding-bottom: 2rem;
+    /* Pull the page content up directly below the Streamlit toolbar. */
+    [data-testid="stAppViewContainer"] .main .block-container,
+    [data-testid="stMainBlockContainer"],
+    .stMainBlockContainer,
+    section[data-testid="stMain"] > div,
+    section[data-testid="stMain"] div[data-testid="stMainBlockContainer"] {
+        padding-top: 0 !important;
+        padding-block-start: 0 !important;
         margin-top: 0 !important;
     }
+    [data-testid="stMainBlockContainer"] > div:first-child,
+    .stMainBlockContainer > div:first-child {
+        margin-top: 0 !important;
+        padding-top: 0 !important;
+    }
     [data-testid="stHeader"] {
-        height: 1.5rem !important;
-        min-height: 1.5rem !important;
+        height: 2.4rem !important;
+        min-height: 2.4rem !important;
     }
     h1 {margin-top: 0 !important; padding-top: 0 !important;}
-    /* Hide only Streamlit's native Share action; keep star, edit and theme controls. */
-    [data-testid="stToolbar"] button[aria-label="Share"] {
+
+    /* Replace only the native Share action with our own permission-aware Share control.
+       Keep the native star, edit/Codespace and theme controls visible. */
+    div[data-testid="stToolbarActionButton"],
+    div.stToolbarActionButton {
         display: none !important;
     }
     div.st-key-toolbar_share_button {
         position: fixed !important;
-        top: 0.12rem !important;
-        right: 10.8rem !important;
+        top: 0.08rem !important;
+        right: 4.45rem !important;
         z-index: 1000001 !important;
         width: auto !important;
+        margin: 0 !important;
     }
     div.st-key-toolbar_share_button button {
         min-height: 2rem !important;
         height: 2rem !important;
-        padding: 0 0.45rem !important;
+        width: auto !important;
+        padding: 0 0.35rem !important;
         border: 0 !important;
+        border-radius: 0.35rem !important;
         background: transparent !important;
         color: var(--text-color) !important;
         font-size: 0.9rem !important;
         font-weight: 400 !important;
+        box-shadow: none !important;
     }
     div.st-key-toolbar_share_button button:hover {
         background: rgba(128, 128, 128, 0.12) !important;
     }
+
+    /* Compact Create Campaign action. */
     div.st-key-create_campaign_button button {
-        min-height: 2.35rem !important;
-        height: 2.35rem !important;
-        padding: 0.35rem 0.7rem !important;
-        font-size: 0.9rem !important;
+        min-height: 2.1rem !important;
+        height: 2.1rem !important;
+        width: auto !important;
+        min-width: 0 !important;
+        padding: 0.25rem 0.65rem !important;
+        font-size: 0.82rem !important;
         font-weight: 600 !important;
     }
-    section[data-testid="stSidebar"] div[data-testid="stAlert"] {
-        background: transparent !important;
-        border: 1px solid rgba(255,255,255,0.45) !important;
+
+    /* High-contrast mock-mode label on the dark sidebar. */
+    .mock-mode-badge {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.72rem 0.55rem;
+        margin: 0.7rem 0;
+        border: 1px solid rgba(255,255,255,0.35);
+        border-radius: 0.55rem;
+        background: rgba(255,255,255,0.07);
+        color: #ffffff !important;
+        text-align: center;
+        font-size: 0.9rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
     }
-    section[data-testid="stSidebar"] div[data-testid="stAlert"] * {
+    section[data-testid="stSidebar"] .mock-mode-badge {
         color: #ffffff !important;
     }
     [data-testid="stMetricValue"] {font-size: 1.8rem;}
@@ -956,7 +990,7 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     st.divider()
-    st.success("MOCK MODE — ON")
+    st.markdown('<div class="mock-mode-badge">MOCK MODE — ON</div>', unsafe_allow_html=True)
     st.divider()
     st.selectbox(
         "Switch Mock User",
@@ -1399,8 +1433,7 @@ def render_invitation_acceptance():
 
 render_invitation_acceptance()
 
-# App-owned Share control replaces Streamlit's native Share action.
-# The native Share action only shares the app URL; this dialog manages workspace permissions.
+# Single Share control, positioned where Streamlit's native Share action appears.
 if st.button("Share", key="toolbar_share_button", type="secondary"):
     show_share_dialog()
 
@@ -1414,7 +1447,7 @@ if active_page == "Campaigns":
         st.caption("Manage campaigns, review their criteria, and open the linked Clay table.")
     with create_col:
         if is_mock_admin:
-            if st.button("＋ Create Campaign", key="create_campaign_button", type="primary", use_container_width=True):
+            if st.button("＋ Create Campaign", key="create_campaign_button", type="primary", use_container_width=False):
                 st.session_state["show_create_campaign_form"] = True
                 st.session_state["editing_campaign_id"] = None
                 st.rerun()
