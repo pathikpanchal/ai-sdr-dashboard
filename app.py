@@ -2270,6 +2270,9 @@ if active_page == "Campaigns":
             with duplicate_col:
                 if selected_permission in ("Owner", "Can Edit"):
                     if st.button("Duplicate Campaign", key="selected_duplicate_campaign", use_container_width=True):
+                        # Duplication is immediate; never leave an edit modal open from a prior action.
+                        st.session_state["editing_campaign_id"] = None
+                        st.session_state.pop("campaign_edit_context", None)
                         source_campaign = campaign_as_dict(selected_id)
                         if source_campaign:
                             new_id = str(uuid.uuid4())
@@ -2316,8 +2319,9 @@ if active_page == "Campaigns":
                             st.session_state["overview_campaign"] = new_id
                             st.session_state["_force_campaign_selection"] = new_id
                             st.session_state["_reset_campaign_preview_widget"] = True
-                            st.session_state["editing_campaign_id"] = new_id
-                            st.session_state["campaign_edit_context"] = "duplicate"
+                            # Keep the duplicate selected, but leave the editor closed.
+                            st.session_state["editing_campaign_id"] = None
+                            st.session_state.pop("campaign_edit_context", None)
                             st.rerun()
                         else:
                             st.error("The selected campaign could not be found, so it was not duplicated.")
@@ -2325,6 +2329,9 @@ if active_page == "Campaigns":
             with delete_col:
                 if selected_permission == "Owner":
                     if st.button("Delete Campaign", key="selected_delete_campaign", use_container_width=True):
+                        # Delete should open only its confirmation dialog, never the editor.
+                        st.session_state["editing_campaign_id"] = None
+                        st.session_state.pop("campaign_edit_context", None)
                         st.session_state["pending_campaign_action"] = "delete"
                         st.session_state["pending_campaign_action_id"] = selected_id
                         st.session_state["_force_campaign_selection"] = selected_id
