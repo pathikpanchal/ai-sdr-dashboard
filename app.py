@@ -131,6 +131,14 @@ def get_connection():
         )
         """
     )
+    campaign_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(campaigns)").fetchall()
+    }
+    if "industry_clay_value" not in campaign_columns:
+        connection.execute("ALTER TABLE campaigns ADD COLUMN industry_clay_value TEXT DEFAULT ''")
+    if "industry_mapping_status" not in campaign_columns:
+        connection.execute("ALTER TABLE campaigns ADD COLUMN industry_mapping_status TEXT DEFAULT ''")
+
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS leads (
@@ -574,11 +582,105 @@ def clay_quote(value):
     return f'"{value}"'
 
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_clay_company_industry_options(api_key):
+    """Fetch Clay's live controlled industry values from its company filter schema."""
+    response = requests.get(
+        "https://api.clay.com/public/v0/search/filters-mode/fields",
+        headers={"clay-api-key": api_key},
+        params={"source_type": "companies"},
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"Could not load Clay industry options (HTTP {response.status_code}): "
+            f"{response.text[:500]}"
+        )
+    payload = response.json()
+    fields = payload.get("fields", [])
+    industry_field = next(
+        (field for field in fields if field.get("name") in ("industries", "industry")),
+        None,
+    )
+    if not industry_field:
+        raise RuntimeError("Clay's company-search schema did not return an industry field.")
+    options = industry_field.get("allowedValues") or industry_field.get("allowed_values") or []
+    options = [str(value).strip() for value in options if str(value).strip()]
+    if not options:
+        raise RuntimeError("Clay returned no allowed industry values.")
+    return options
+
+
+def normalize_industry_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+
+
+def map_industry_to_clay(user_input, allowed_values):
+    """Map common sales language to a live Clay category; never invent a category."""
+    from difflib import get_close_matches
+
+    raw = str(user_input or "").strip()
+    if not raw:
+        return [], "No industry filter entered."
+
+    # Explicit aliases are intentionally conservative. Add aliases only where the
+    # business meaning is sufficiently clear; otherwise ask the salesperson.
+    aliases = {
+        "finance": ["Financial Services"],
+        "financial services": ["Financial Services"],
+        "fintech": ["Financial Services"],
+        "banking": ["Banking"],
+        "insurance": ["Insurance"],
+        "accounting": ["Accounting"],
+        "healthcare": ["Hospitals and Health Care", "Medical Practices"],
+        "health care": ["Hospitals and Health Care", "Medical Practices"],
+        "hospital": ["Hospitals and Health Care"],
+        "hospitals": ["Hospitals and Health Care"],
+        "saas": ["Software Development"],
+        "software": ["Software Development"],
+        "software company": ["Software Development"],
+        "it services": ["IT Services and IT Consulting"],
+        "information technology": ["IT Services and IT Consulting"],
+    }
+
+    normalized_options = {normalize_industry_text(option): option for option in allowed_values}
+    normalized_input = normalize_industry_text(raw)
+
+    # Exact category match takes priority.
+    if normalized_input in normalized_options:
+        return [normalized_options[normalized_input]], "Exact Clay category match"
+
+    # Apply only aliases whose target exists in Clay's current live option list.
+    alias_targets = aliases.get(normalized_input, [])
+    matched_aliases = [
+        normalized_options[normalize_industry_text(target)]
+        for target in alias_targets
+        if normalize_industry_text(target) in normalized_options
+    ]
+    if matched_aliases:
+        return matched_aliases, "Automatic synonym mapping"
+
+    # For other entries, suggest a close category only when it is a strong text match.
+    close = get_close_matches(
+        normalized_input,
+        list(normalized_options.keys()),
+        n=1,
+        cutoff=0.88,
+    )
+    if close:
+        return [normalized_options[close[0]]], "Close category match — please review"
+
+    return [], "No safe automatic match. Please choose a Clay industry category."
+
+
 def build_clay_company_query(campaign):
+
     """Build a company-only Clay search from the campaign's company-level filters."""
     clauses = []
 
-    industries = split_clay_values(campaign.get("industry", ""))
+    mapped_industry = str(campaign.get("industry_clay_value", "") or "").strip()
+    industries = [mapped_industry] if mapped_industry else split_clay_values(campaign.get("industry", ""))
     if industries:
         clauses.append("industry in (" + ", ".join(clay_quote(v) for v in industries) + ")")
 
@@ -1238,15 +1340,61 @@ if active_page == "Campaigns":
             selected_permission = get_campaign_permission(selected_id)
             selected_approved = bool(int(selected_row.get("criteria_approved", 0) or 0))
             clay_api_key = get_clay_api_key()
+
+            # Resolve the user's industry wording against Clay's current live vocabulary.
+            industry_input = str(selected_row.get("industry", "") or "").strip()
+            mapped_industry_values = []
+            industry_mapping_status = "No industry filter entered."
+            industry_mapping_error = ""
+            if industry_input and clay_api_key:
+                try:
+                    live_industry_options = fetch_clay_company_industry_options(clay_api_key)
+                    mapped_industry_values, industry_mapping_status = map_industry_to_clay(
+                        industry_input, live_industry_options
+                    )
+                except Exception as mapping_exc:
+                    industry_mapping_error = str(mapping_exc)
+
+            if industry_input:
+                with st.container(border=True):
+                    st.markdown("**Industry Mapping (Clay)**")
+                    st.write(f"Your input: **{industry_input}**")
+                    if industry_mapping_error:
+                        st.error(industry_mapping_error)
+                    elif mapped_industry_values:
+                        st.write("Clay industry: **" + ", ".join(mapped_industry_values) + "**")
+                        st.caption(industry_mapping_status + " · Options checked against Clay's live company-search list.")
+                        if industry_mapping_status.startswith("Close category"):
+                            st.warning("Please review this suggested category before approving the campaign.")
+                    elif not clay_api_key:
+                        st.warning("Add the Clay API key in Streamlit Secrets to load and map Clay industry options.")
+                    else:
+                        st.warning(industry_mapping_status)
+            elif not clay_api_key:
+                st.caption("Add the Clay API key in Streamlit Secrets to enable live Clay search.")
+
+            mapping_ready = (not industry_input) or bool(mapped_industry_values)
+            mapping_needs_review = industry_mapping_status.startswith("Close category")
             with approve_col:
                 if selected_permission in ("Owner", "Can Edit"):
                     if selected_approved:
                         st.button("Criteria Approved", key="selected_criteria_approved", disabled=True, use_container_width=True)
-                    elif st.button("Approve Criteria", key="approve_campaign_criteria", type="primary", use_container_width=True):
+                    elif st.button(
+                        "Approve Criteria",
+                        key="approve_campaign_criteria",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=(not mapping_ready or bool(industry_mapping_error) or mapping_needs_review),
+                    ):
                         approved_at = datetime.now().isoformat(timespec="seconds")
+                        mapped_value = ", ".join(mapped_industry_values) if industry_input else ""
                         conn.execute(
-                            "UPDATE campaigns SET criteria_approved = 1, criteria_approved_by = ?, criteria_approved_at = ?, status = ? WHERE id = ?",
-                            (current_mock_user_name, approved_at, "Criteria Approved", selected_id),
+                            """UPDATE campaigns
+                               SET criteria_approved = 1, criteria_approved_by = ?, criteria_approved_at = ?,
+                                   industry_clay_value = ?, industry_mapping_status = ?, status = ?
+                               WHERE id = ?""",
+                            (current_mock_user_name, approved_at, mapped_value, industry_mapping_status,
+                             "Criteria Approved", selected_id),
                         )
                         conn.commit()
                         log_activity("Campaign criteria approved", selected_id, selected_name, current_mock_user_name,
@@ -1255,12 +1403,18 @@ if active_page == "Campaigns":
                 else:
                     st.caption("View Only")
             with build_col:
+                if mapping_needs_review:
+                    st.caption("Review the suggested Clay industry before approving.")
                 if st.button(
                     "Build Campaign Data",
                     key="build_campaign_data_clay",
                     type="primary",
                     use_container_width=True,
-                    disabled=(not selected_approved or not clay_api_key or selected_permission not in ("Owner", "Can Edit")),
+                    disabled=(
+                        not selected_approved or not clay_api_key
+                        or selected_permission not in ("Owner", "Can Edit")
+                        or not mapping_ready or bool(industry_mapping_error) or mapping_needs_review
+                    ),
                 ):
                     campaign_for_clay = campaign_as_dict(selected_id) or {}
                     try:
