@@ -266,6 +266,42 @@ def get_connection():
         """
     )
 
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clay_people_search_runs (
+            id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            clay_search_id TEXT DEFAULT '',
+            query_text TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            has_more INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            error_message TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clay_people_results (
+            id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            search_run_id TEXT NOT NULL,
+            clay_profile_id TEXT DEFAULT '',
+            full_name TEXT DEFAULT '',
+            job_title TEXT DEFAULT '',
+            location TEXT DEFAULT '',
+            location_country TEXT DEFAULT '',
+            company_name TEXT DEFAULT '',
+            company_domain TEXT DEFAULT '',
+            linkedin_url TEXT DEFAULT '',
+            raw_json TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     # Add new columns safely to databases created by the earlier dashboard version.
     migrations = {
         "campaigns": {
@@ -708,52 +744,63 @@ def build_clay_company_query(campaign):
 
 
 def run_clay_company_search(campaign, campaign_id, api_key):
-    """Create a Clay company search and fetch its first page (up to 50 results)."""
-    query_text = build_clay_company_query(campaign)
-    headers = {
-        "clay-api-key": api_key,
-        "Content-Type": "application/json",
-    }
+    """Run a Clay company search using the explicit headquarters-only country filter."""
+    mapped_industry = str(campaign.get("industry_clay_value", "") or "").strip()
+    industry_values = [mapped_industry] if mapped_industry else split_clay_values(campaign.get("industry", ""))
+    country_values = [normalize_country_name(v).title() for v in split_clay_values(campaign.get("company_country", ""))]
+
+    filters = {}
+    if industry_values:
+        filters["industries"] = industry_values
+    if country_values:
+        filters["country_names"] = country_values
+        filters["location_headquarters_only"] = True
+
+    if not filters:
+        raise ValueError("Add at least one company-level filter before searching Clay.")
+
+    headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
     base_url = "https://api.clay.com/public/v0"
     created_at = datetime.now().isoformat(timespec="seconds")
     run_id = str(uuid.uuid4())
     clay_search_id = ""
+    query_text = json.dumps(
+        {"source_type": "companies", "filters": filters},
+        ensure_ascii=False,
+        indent=2,
+    )
 
     try:
         create_response = requests.post(
-            f"{base_url}/search/query-mode",
+            f"{base_url}/search/filters-mode",
             headers=headers,
-            json={"query": query_text},
+            json={"source_type": "companies", "filters": filters},
             timeout=30,
         )
         if not create_response.ok:
-            try:
-                detail = create_response.json().get("message", create_response.text)
-            except Exception:
-                detail = create_response.text
-            raise RuntimeError(f"Clay search creation failed (HTTP {create_response.status_code}): {detail}")
-
-        create_payload = create_response.json()
-        clay_search_id = create_payload.get("search_id", "")
+            detail = create_response.text[:1000]
+            raise RuntimeError(
+                f"Clay company search creation failed (HTTP {create_response.status_code}): {detail}"
+            )
+        clay_search_id = create_response.json().get("search_id", "")
         if not clay_search_id:
-            raise RuntimeError("Clay created the request but did not return a search ID.")
+            raise RuntimeError("Clay did not return a company search ID.")
 
         results_response = requests.post(
-            f"{base_url}/search/query-mode/{clay_search_id}/run",
+            f"{base_url}/search/filters-mode/{clay_search_id}/run",
             headers=headers,
             json={"limit": 50},
             timeout=45,
         )
         if not results_response.ok:
-            try:
-                detail = results_response.json().get("message", results_response.text)
-            except Exception:
-                detail = results_response.text
-            raise RuntimeError(f"Clay results request failed (HTTP {results_response.status_code}): {detail}")
+            raise RuntimeError(
+                f"Clay company results request failed (HTTP {results_response.status_code}): "
+                f"{results_response.text[:1000]}"
+            )
 
-        results_payload = results_response.json()
-        rows = results_payload.get("data", []) or []
-        has_more = bool(results_payload.get("has_more", False))
+        payload = results_response.json()
+        rows = payload.get("data", []) or []
+        has_more = bool(payload.get("has_more", False))
 
         conn.execute(
             """INSERT INTO clay_search_runs
@@ -779,7 +826,7 @@ def run_clay_company_search(campaign, campaign_id, api_key):
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     str(uuid.uuid4()), campaign_id, run_id,
-                    str(row.get("clay_company_id", "") or ""),
+                    str(row.get("clay_company_id", row.get("id", "")) or ""),
                     str(row.get("name", "") or ""),
                     str(row.get("domain", "") or ""),
                     str(row.get("industry", "") or ""),
@@ -788,7 +835,7 @@ def run_clay_company_search(campaign, campaign_id, api_key):
                     str(row.get("type", "") or ""),
                     str(location_text or ""),
                     str(row.get("description", "") or ""),
-                    str(row.get("linkedin_url", "") or ""),
+                    str(row.get("linkedin_url", row.get("linkedin_url_company", "")) or ""),
                     str(row.get("annual_revenue", "") or ""),
                     json.dumps(row, ensure_ascii=False),
                     created_at,
@@ -806,6 +853,10 @@ def run_clay_company_search(campaign, campaign_id, api_key):
             "query": query_text,
             "count": len(rows),
             "has_more": has_more,
+            "company_domains": list(dict.fromkeys(
+                str(row.get("domain", "")).strip().lower()
+                for row in rows if str(row.get("domain", "")).strip()
+            )),
         }
     except Exception as exc:
         existing_run = conn.execute("SELECT 1 FROM clay_search_runs WHERE id = ?", (run_id,)).fetchone()
@@ -821,9 +872,156 @@ def run_clay_company_search(campaign, campaign_id, api_key):
                    VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)""",
                 (run_id, campaign_id, clay_search_id, query_text, "Failed", str(exc)[:1000], created_at),
             )
-        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Clay Search Failed", campaign_id))
+        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Clay Company Search Failed", campaign_id))
         conn.commit()
         raise
+
+
+def build_clay_people_query(campaign, company_domains):
+    """Search for people located in the requested country at the companies just found."""
+    if not company_domains:
+        raise ValueError("Clay returned no company domains, so contact search cannot be scoped to those companies.")
+
+    clauses = []
+    contact_countries = [
+        normalize_country_name(value).title()
+        for value in split_clay_values(campaign.get("contact_country", ""))
+    ]
+    if contact_countries:
+        country_clause = " or ".join(
+            f"location_country = {clay_quote(country)}" for country in contact_countries
+        )
+        clauses.append(f"({country_clause})")
+
+    domain_clause = ", ".join(clay_quote(domain) for domain in company_domains)
+    clauses.append(
+        "experiences.any(is_current = true and company.domain in (" + domain_clause + "))"
+    )
+
+    return "select from people where " + " and ".join(clauses)
+
+
+def run_clay_people_search(campaign, campaign_id, api_key, company_domains):
+    """Run a separate people search, restricted to the current company-search domains."""
+    query_text = build_clay_people_query(campaign, company_domains)
+    headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
+    base_url = "https://api.clay.com/public/v0"
+    created_at = datetime.now().isoformat(timespec="seconds")
+    run_id = str(uuid.uuid4())
+    clay_search_id = ""
+
+    try:
+        create_response = requests.post(
+            f"{base_url}/search/query-mode",
+            headers=headers,
+            json={"query": query_text},
+            timeout=30,
+        )
+        if not create_response.ok:
+            raise RuntimeError(
+                f"Clay contact search creation failed (HTTP {create_response.status_code}): "
+                f"{create_response.text[:1000]}"
+            )
+        clay_search_id = create_response.json().get("search_id", "")
+        if not clay_search_id:
+            raise RuntimeError("Clay did not return a contact search ID.")
+
+        results_response = requests.post(
+            f"{base_url}/search/query-mode/{clay_search_id}/run",
+            headers=headers,
+            json={"limit": 50},
+            timeout=45,
+        )
+        if not results_response.ok:
+            raise RuntimeError(
+                f"Clay contact results request failed (HTTP {results_response.status_code}): "
+                f"{results_response.text[:1000]}"
+            )
+
+        payload = results_response.json()
+        rows = payload.get("data", []) or []
+        has_more = bool(payload.get("has_more", False))
+
+        conn.execute(
+            """INSERT INTO clay_people_search_runs
+               (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete", "", created_at),
+        )
+        for row in rows:
+            location = row.get("location") or {}
+            if isinstance(location, dict):
+                location_text = location.get("name", "")
+                location_country = location.get("country") or location.get("country_name") or ""
+            else:
+                location_text = str(location or "")
+                location_country = row.get("location_country", row.get("country", ""))
+            current_experiences = row.get("experiences") or row.get("experience") or []
+            current_company = {}
+            if isinstance(current_experiences, list):
+                current_company = next(
+                    (exp.get("company", {}) for exp in current_experiences
+                     if isinstance(exp, dict) and exp.get("is_current")),
+                    {},
+                ) or {}
+            conn.execute(
+                """INSERT INTO clay_people_results
+                   (id, campaign_id, search_run_id, clay_profile_id, full_name, job_title,
+                    location, location_country, company_name, company_domain, linkedin_url, raw_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), campaign_id, run_id,
+                    str(row.get("clay_profile_id", row.get("id", "")) or ""),
+                    str(row.get("name", row.get("full_name", "")) or ""),
+                    str(row.get("job_title", row.get("title", "")) or ""),
+                    str(location_text or ""),
+                    str(location_country or ""),
+                    str(row.get("company_name", current_company.get("name", "")) or ""),
+                    str(row.get("company_domain", current_company.get("domain", "")) or ""),
+                    str(row.get("linkedin_url", row.get("profile_url", "")) or ""),
+                    json.dumps(row, ensure_ascii=False),
+                    created_at,
+                ),
+            )
+        conn.commit()
+        return {
+            "run_id": run_id,
+            "search_id": clay_search_id,
+            "query": query_text,
+            "count": len(rows),
+            "has_more": has_more,
+        }
+    except Exception as exc:
+        conn.execute(
+            """INSERT INTO clay_people_search_runs
+               (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
+               VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)""",
+            (run_id, campaign_id, clay_search_id, query_text, "Failed", str(exc)[:1000], created_at),
+        )
+        conn.commit()
+        raise
+
+
+
+def load_latest_clay_people_search(campaign_id):
+    run = conn.execute(
+        "SELECT * FROM clay_people_search_runs WHERE campaign_id = ? ORDER BY created_at DESC LIMIT 1",
+        (campaign_id,),
+    ).fetchone()
+    if not run:
+        return None, pd.DataFrame()
+    columns = [description[0] for description in conn.execute("PRAGMA table_info(clay_people_search_runs)").description] if False else []
+    run_dict = dict(zip(
+        [item[1] for item in conn.execute("PRAGMA table_info(clay_people_search_runs)").fetchall()],
+        run,
+    ))
+    results = pd.read_sql_query(
+        "SELECT full_name, job_title, location, location_country, company_name, company_domain, linkedin_url "
+        "FROM clay_people_results WHERE search_run_id = ? ORDER BY full_name",
+        conn,
+        params=(run_dict["id"],),
+    )
+    return run_dict, results
 
 
 def load_latest_clay_company_search(campaign_id):
@@ -1418,17 +1616,29 @@ if active_page == "Campaigns":
                 ):
                     campaign_for_clay = campaign_as_dict(selected_id) or {}
                     try:
-                        with st.spinner("Searching Clay for matching companies..."):
+                        with st.spinner("Searching Clay for companies, then contacts located in the selected country..."):
                             clay_result = run_clay_company_search(campaign_for_clay, selected_id, clay_api_key)
+                            if clay_result["company_domains"]:
+                                people_result = run_clay_people_search(
+                                    campaign_for_clay, selected_id, clay_api_key,
+                                    clay_result["company_domains"],
+                                )
+                            else:
+                                people_result = {
+                                    "count": 0, "search_id": "", "has_more": False,
+                                    "query": "Contact search skipped because no companies matched."
+                                }
                         log_activity(
-                            "Clay company search completed", selected_id, selected_name, current_mock_user_name,
-                            f"Retrieved {clay_result['count']} company records. Clay search ID: {clay_result['search_id']}",
+                            "Clay company and contact searches completed", selected_id, selected_name, current_mock_user_name,
+                            f"Retrieved {clay_result['count']} companies and {people_result['count']} contacts.",
                         )
                         st.session_state["clay_search_notice"] = {
                             "success": True,
                             "count": clay_result["count"],
                             "has_more": clay_result["has_more"],
                             "search_id": clay_result["search_id"],
+                            "people_count": people_result["count"],
+                            "people_search_id": people_result.get("search_id", ""),
                         }
                         st.rerun()
                     except Exception as exc:
@@ -1530,11 +1740,41 @@ if active_page == "Campaigns":
                     )
                     with st.expander("Clay search query sent"):
                         st.code(latest_clay_run["query_text"], language="sql")
+
+
                 else:
                     st.error(f"Latest Clay search failed: {latest_clay_run['error_message']}")
                     with st.expander("Clay search query sent"):
                         st.code(latest_clay_run["query_text"], language="sql")
 
+            latest_people_run, latest_people_results = load_latest_clay_people_search(selected_id)
+            if latest_people_run:
+                st.markdown("#### Clay Contact Search Results")
+                if latest_people_run["status"] == "Complete":
+                    people_cols = st.columns(3)
+                    people_cols[0].metric("Contacts Returned", int(latest_people_run["result_count"]))
+                    people_cols[1].metric("More Results Available", "Yes" if latest_people_run["has_more"] else "No")
+                    people_cols[2].metric("Contact Search Status", latest_people_run["status"])
+                    st.caption(f"Clay People Search ID: {latest_people_run['clay_search_id']} · {latest_people_run['created_at']}")
+                    st.dataframe(
+                        latest_people_results.rename(columns={
+                            "full_name": "Contact Name", "job_title": "Job Title",
+                            "location": "Person Location", "location_country": "Person Country",
+                            "company_name": "Current Company", "company_domain": "Company Domain",
+                            "linkedin_url": "LinkedIn URL",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "LinkedIn URL": st.column_config.LinkColumn("LinkedIn URL", display_text="LinkedIn Profile"),
+                        },
+                    )
+                    with st.expander("Clay contact search query sent"):
+                        st.code(latest_people_run["query_text"], language="sql")
+                else:
+                    st.error(f"Latest Clay contact search failed: {latest_people_run['error_message']}")
+                    with st.expander("Clay contact search query sent"):
+                        st.code(latest_people_run["query_text"], language="sql")
             # A confirmation is always required before any selected-campaign action.
             pending_action = st.session_state.get("pending_campaign_action")
             pending_action_id = st.session_state.get("pending_campaign_action_id")
