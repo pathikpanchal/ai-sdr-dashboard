@@ -1282,41 +1282,25 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
         if not clay_search_id:
             raise RuntimeError("Clay did not return a contact search ID.")
 
-        # Pull additional pages when necessary because the local title and
-        # employer checks can reject records from a broad API result page.
-        # Stop after 10 pages (up to 500 raw profiles) or when Clay is exhausted.
-        raw_rows = []
-        seen_profile_ids = set()
-        has_more = False
-        for _page_number in range(10):
-            results_response = requests.post(
-                f"{base_url}/search/filters-mode/{clay_search_id}/run",
-                headers=headers,
-                json={"limit": 50},
-                timeout=45,
+        # Clay's current plan allows a maximum of 50 results for this search.
+        # Request the results exactly once; do not attempt subsequent pages,
+        # because each additional request can exceed the plan's per-search cap.
+        results_response = requests.post(
+            f"{base_url}/search/filters-mode/{clay_search_id}/run",
+            headers=headers,
+            json={"limit": 50},
+            timeout=45,
+        )
+        if not results_response.ok:
+            raise RuntimeError(
+                f"Clay contact results request failed (HTTP {results_response.status_code}): "
+                f"{results_response.text[:1000]}"
             )
-            if not results_response.ok:
-                raise RuntimeError(
-                    f"Clay contact results request failed (HTTP {results_response.status_code}): "
-                    f"{results_response.text[:1000]}"
-                )
-            page_payload = results_response.json()
-            page_rows = page_payload.get("data", []) or []
-            has_more = bool(page_payload.get("has_more", False))
-            added = 0
-            for page_row in page_rows:
-                profile_id = str(_first_nonempty(
-                    page_row, "clay_profile_id", "clayProfileId", "id", "profile_id", "profileId"
-                ) or json.dumps(page_row, sort_keys=True))
-                if profile_id in seen_profile_ids:
-                    continue
-                seen_profile_ids.add(profile_id)
-                raw_rows.append(page_row)
-                added += 1
-            if not has_more or not page_rows or added == 0:
-                break
-        # A dashboard run stores at most 50 qualified contacts, not merely the
-        # first 50 unfiltered Clay profiles.
+        page_payload = results_response.json()
+        raw_rows = page_payload.get("data", []) or []
+        has_more = bool(page_payload.get("has_more", False))
+        # Do not request another page. `has_more` is shown in the dashboard so
+        # the user knows Clay had additional matches beyond the 50-result cap.
 
         # Defense in depth: compare the current employer against BOTH LinkedIn
         # URLs and domains returned by the company search. The API search itself
@@ -1366,7 +1350,7 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
                (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete",
-             f"Clay returned {len(raw_rows)} raw profiles across pages; excluded {rejected_title_count} outside the requested title keywords and {rejected_count} with a conflicting employer identifier; retained {unverified_employer_count} without employer identifiers under the company-scoped search.", created_at),
+             f"Clay returned {len(raw_rows)} profiles (maximum 50 for this search); excluded {rejected_title_count} outside the requested title keywords and {rejected_count} with a conflicting employer identifier; retained {unverified_employer_count} without employer identifiers under the company-scoped search.", created_at),
         )
 
         for raw_row, person in rows:
