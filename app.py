@@ -1336,44 +1336,30 @@ def campaign_as_dict(campaign_id):
     return dict(zip(columns, row))
 
 
-@st.dialog("Confirm Campaign Action", width="small")
-def show_campaign_action_dialog(action, campaign_id, campaign_name):
-    prompts = {
-        "edit": (
-            f"Open the criteria editor for **{campaign_name}**? "
-            "You can review and save changes before they take effect."
-        ),
-        "duplicate": (
-            f"Create a separate copy of **{campaign_name}**? "
-            "The original campaign will remain unchanged."
-        ),
-        "delete": (
-            f"Delete **{campaign_name}**? Its locally stored company and contact search results "
-            "will also be deleted. This action cannot be undone."
-        ),
-    }
-    confirm_labels = {
-        "edit": "Continue to Edit",
-        "duplicate": "Duplicate Campaign",
-        "delete": "Delete Campaign",
-    }
-    st.write(prompts.get(action, "Confirm this campaign action."))
+@st.dialog("Delete Campaign?", width="small")
+def show_campaign_delete_dialog(campaign_id, campaign_name):
+    st.write(
+        f"Are you sure you want to delete **{campaign_name}**? "
+        "Its locally stored company and contact search results will also be deleted. "
+        "This action cannot be undone."
+    )
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
         if st.button(
-            confirm_labels.get(action, "Confirm"),
+            "Delete Campaign",
             type="primary",
             use_container_width=True,
-            key=f"confirm_dialog_{action}_{campaign_id}",
+            key=f"confirm_delete_campaign_{campaign_id}",
         ):
             st.session_state["campaign_action_confirmed"] = True
             st.session_state["campaign_action_confirmed_id"] = campaign_id
+            st.session_state["_force_campaign_selection"] = campaign_id
             st.rerun()
     with cancel_col:
         if st.button(
             "Cancel",
             use_container_width=True,
-            key=f"cancel_dialog_{action}_{campaign_id}",
+            key=f"cancel_delete_campaign_{campaign_id}",
         ):
             st.session_state.pop("pending_campaign_action", None)
             st.session_state.pop("pending_campaign_action_id", None)
@@ -1396,6 +1382,190 @@ def log_activity(action, campaign_id=None, campaign_name="", actor="Unassigned",
         ),
     )
     conn.commit()
+
+
+def next_duplicate_campaign_name(original_name):
+    """Return a unique copy name: Name (Copy), Name (Copy 2), etc."""
+    existing_names = {
+        str(row[0] or "").strip().casefold()
+        for row in conn.execute("SELECT name FROM campaigns").fetchall()
+    }
+    base_name = f"{str(original_name or 'Untitled campaign').strip()} (Copy)"
+    candidate = base_name
+    suffix = 2
+    while candidate.casefold() in existing_names:
+        candidate = f"{base_name.rsplit(' (Copy)', 1)[0]} (Copy {suffix})"
+        suffix += 1
+    return candidate
+
+
+@st.dialog("Edit Campaign", width="large")
+def show_edit_campaign_dialog(campaign_id):
+    campaign = campaign_as_dict(campaign_id)
+    if not campaign:
+        st.error("This campaign could not be found. Close this window and refresh the dashboard.")
+        return
+
+    st.caption("Update the campaign details and targeting criteria. Changes require criteria approval again.")
+
+    saved_seniority = [
+        value.strip()
+        for value in str(campaign.get("seniority", "Manager") or "Manager").split(",")
+        if value.strip() in SENIORITY_OPTIONS
+    ] or ["Manager"]
+
+    current_job_level = str(campaign.get("job_level", "Above") or "Above")
+    if current_job_level not in JOB_LEVEL_OPTIONS:
+        current_job_level = "Above"
+
+    with st.form(f"edit_campaign_modal_form_{campaign_id}", enter_to_submit=False):
+        st.markdown("**Campaign details**")
+        name_col, owner_col = st.columns(2)
+        with name_col:
+            edit_name = st.text_input("Campaign Name *", value=str(campaign.get("name") or ""))
+        with owner_col:
+            edit_owner = st.text_input(
+                "Campaign Owner",
+                value=str(campaign.get("campaign_owner", "Unassigned") or "Unassigned"),
+            )
+
+        st.divider()
+        st.markdown("**Company criteria**")
+        industry_col, company_country_col = st.columns(2)
+        with industry_col:
+            edit_industry = st.text_input(
+                "Industry",
+                value=str(campaign.get("industry") or ""),
+                help="Enter multiple industries separated by commas, e.g. Pharmaceuticals, Retail.",
+            )
+        with company_country_col:
+            edit_company_country = st.text_input(
+                "Company Country (Headquarters)",
+                value=str(campaign.get("company_country") or ""),
+                help="Use the company's headquarters country, not countries where it has branch offices.",
+            )
+        cms_col, score_col = st.columns(2)
+        with cms_col:
+            edit_current_cms = st.text_input(
+                "Current CMS",
+                value=str(campaign.get("current_cms") or ""),
+                help="Multiple CMS platforms are allowed, e.g. WordPress, Drupal, Sitecore.",
+            )
+        with score_col:
+            edit_min_score = st.slider(
+                "Minimum company and contact ICP score",
+                min_value=0,
+                max_value=100,
+                value=int(campaign.get("min_score", 0) or 0),
+            )
+
+        st.divider()
+        st.markdown("**Contact criteria**")
+        contact_country_col, department_col = st.columns(2)
+        with contact_country_col:
+            edit_contact_country = st.text_input(
+                "Contact Country (Person Location)",
+                value=str(campaign.get("contact_country") or ""),
+                help="Use the person's profile location, not the employer's headquarters country.",
+            )
+        with department_col:
+            edit_department = st.text_input(
+                "Department",
+                value=str(campaign.get("department") or ""),
+                help="Multiple departments are allowed, e.g. Marketing, Sales.",
+            )
+        edit_target_titles = st.text_input(
+            "Job Titles",
+            value=str(campaign.get("target_titles") or ""),
+            help="Enter several titles separated by commas, e.g. CMO, Marketing Director, Head of Marketing.",
+        )
+        seniority_col, job_level_col = st.columns(2)
+        with seniority_col:
+            edit_seniority = st.multiselect(
+                "Seniority",
+                SENIORITY_OPTIONS,
+                default=saved_seniority,
+                help="Select one or more seniority levels.",
+            )
+        with job_level_col:
+            edit_job_level = st.selectbox(
+                "Job Level",
+                JOB_LEVEL_OPTIONS,
+                index=JOB_LEVEL_OPTIONS.index(current_job_level),
+                help=(
+                    "Above includes the selected level(s) and higher. Below includes "
+                    "the selected level(s) and lower. Exact matches only selected levels."
+                ),
+            )
+
+        st.divider()
+        st.markdown("**Campaign execution details**")
+        edit_email_instructions = st.text_area(
+            "Email Sequence Instructions",
+            value=str(campaign.get("email_sequence_instructions", "") or ""),
+            height=120,
+        )
+        edit_clay_table_url = st.text_input(
+            "Clay Table Link (optional)",
+            value=str(campaign.get("clay_table_url", "") or ""),
+            placeholder="Paste the Clay table URL here when available",
+            help="Optional reference link to a Clay table created separately.",
+        )
+        save_changes = st.form_submit_button("Save Changes", type="primary", use_container_width=True)
+
+    cancel_col, _ = st.columns([1, 4])
+    with cancel_col:
+        if st.button("Cancel", key=f"cancel_edit_campaign_modal_{campaign_id}", use_container_width=True):
+            st.session_state["editing_campaign_id"] = None
+            st.session_state.pop("campaign_edit_context", None)
+            st.rerun()
+
+    if save_changes:
+        if not edit_name.strip():
+            st.error("Please enter a campaign name.")
+        elif not edit_seniority and edit_job_level != "Any":
+            st.error("Select at least one seniority level, or choose Job Level = Any.")
+        else:
+            owner_value = edit_owner.strip() or "Unassigned"
+            conn.execute(
+                """
+                UPDATE campaigns
+                SET name = ?, campaign_owner = ?, industry = ?, company_country = ?,
+                    contact_country = ?, target_titles = ?, min_score = ?, current_cms = ?,
+                    department = ?, seniority = ?, job_level = ?,
+                    email_sequence_instructions = ?, clay_table_url = ?, status = ?,
+                    criteria_approved = 0, criteria_approved_by = '', criteria_approved_at = ''
+                WHERE id = ?
+                """,
+                (
+                    edit_name.strip(), owner_value, edit_industry.strip(),
+                    edit_company_country.strip(), edit_contact_country.strip(),
+                    edit_target_titles.strip(), int(edit_min_score), edit_current_cms.strip(),
+                    edit_department.strip(), ", ".join(edit_seniority), edit_job_level,
+                    edit_email_instructions.strip(), edit_clay_table_url.strip(),
+                    "Draft", campaign_id,
+                ),
+            )
+
+            # Criteria edits invalidate the previous approval and the campaign's previous search output.
+            conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (campaign_id,))
+            conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (campaign_id,))
+            conn.execute("DELETE FROM leads WHERE campaign_id = ?", (campaign_id,))
+            conn.commit()
+            log_activity(
+                "Campaign criteria updated", campaign_id, edit_name.strip(), owner_value,
+                "Criteria changed. Previous approval and Clay search results were cleared; "
+                "approve the updated criteria before searching again.",
+            )
+            st.session_state["campaign_edit_notice"] = (
+                "Campaign updated. Please approve the revised criteria before running a new Clay search."
+            )
+            st.session_state["active_campaign_id"] = campaign_id
+            st.session_state["run_campaign_selector"] = campaign_id
+            st.session_state["lead_campaign_selector"] = campaign_id
+            st.session_state["editing_campaign_id"] = None
+            st.session_state.pop("campaign_edit_context", None)
+            st.rerun()
 
 
 def get_invitation_email_config():
@@ -1701,6 +1871,10 @@ if active_page == "Campaigns":
     if create_notice:
         st.success(create_notice)
 
+    duplicate_notice = st.session_state.pop("campaign_duplicate_notice", None)
+    if duplicate_notice:
+        st.success(duplicate_notice)
+
     campaigns = load_campaigns()
     if campaigns.empty:
         if is_mock_admin:
@@ -1905,23 +2079,84 @@ if active_page == "Campaigns":
             with edit_col:
                 if selected_permission in ("Owner", "Can Edit"):
                     if st.button("Edit Campaign", key="selected_edit_campaign", use_container_width=True):
-                        st.session_state["pending_campaign_action"] = "edit"
-                        st.session_state["pending_campaign_action_id"] = selected_id
+                        st.session_state["editing_campaign_id"] = selected_id
+                        st.session_state["overview_campaign"] = selected_id
+                        st.session_state["_force_campaign_selection"] = selected_id
+                        st.session_state.pop("campaign_edit_context", None)
+                        log_activity("Edit opened", selected_id, selected_name, selected_owner)
                         st.rerun()
                 else:
                     st.caption("View Only")
+
             with duplicate_col:
                 if selected_permission in ("Owner", "Can Edit"):
                     if st.button("Duplicate Campaign", key="selected_duplicate_campaign", use_container_width=True):
-                        st.session_state["pending_campaign_action"] = "duplicate"
-                        st.session_state["pending_campaign_action_id"] = selected_id
-                        st.rerun()
+                        source_campaign = campaign_as_dict(selected_id)
+                        if source_campaign:
+                            new_id = str(uuid.uuid4())
+                            new_name = next_duplicate_campaign_name(source_campaign.get("name", selected_name))
+                            duplicate_owner = selected_owner if is_mock_admin else current_mock_user_name
+                            conn.execute(
+                                """
+                                INSERT INTO campaigns
+                                (id, name, industry, company_country, contact_country, target_titles,
+                                 min_score, status, created_at, current_cms, department, seniority,
+                                 job_level, email_sequence_instructions, clay_table_url, campaign_owner)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    new_id,
+                                    new_name,
+                                    source_campaign.get("industry", "") or "",
+                                    source_campaign.get("company_country", "") or "",
+                                    source_campaign.get("contact_country", "") or "",
+                                    source_campaign.get("target_titles", "") or "",
+                                    int(source_campaign.get("min_score", 0) or 0),
+                                    "Draft",
+                                    datetime.now().isoformat(timespec="seconds"),
+                                    source_campaign.get("current_cms", "") or "",
+                                    source_campaign.get("department", "") or "",
+                                    source_campaign.get("seniority", "Manager") or "Manager",
+                                    source_campaign.get("job_level", "Above") or "Above",
+                                    source_campaign.get("email_sequence_instructions", "") or "",
+                                    "",  # A duplicate starts without the original Clay table URL.
+                                    duplicate_owner,
+                                ),
+                            )
+                            conn.commit()
+                            log_activity(
+                                "Campaign duplicated",
+                                new_id,
+                                new_name,
+                                duplicate_owner,
+                                f"Duplicated from campaign: {selected_name}",
+                            )
+                            st.session_state["campaign_duplicate_notice"] = (
+                                f"Campaign duplicated successfully: {new_name}"
+                            )
+                            st.session_state["overview_campaign"] = new_id
+                            st.session_state["_force_campaign_selection"] = new_id
+                            st.session_state["_reset_campaign_preview_widget"] = True
+                            st.session_state["editing_campaign_id"] = new_id
+                            st.session_state["campaign_edit_context"] = "duplicate"
+                            st.rerun()
+                        else:
+                            st.error("The selected campaign could not be found, so it was not duplicated.")
+
             with delete_col:
                 if selected_permission == "Owner":
                     if st.button("Delete Campaign", key="selected_delete_campaign", use_container_width=True):
                         st.session_state["pending_campaign_action"] = "delete"
                         st.session_state["pending_campaign_action_id"] = selected_id
+                        st.session_state["_force_campaign_selection"] = selected_id
                         st.rerun()
+
+            # Open the editor as a centered modal instead of placing it below search results.
+            if (
+                st.session_state.get("editing_campaign_id") == selected_id
+                and selected_permission in ("Owner", "Can Edit")
+            ):
+                show_edit_campaign_dialog(selected_id)
 
             if not selected_approved:
                 st.info("Review the campaign filters, then select **Approve Criteria** to unlock the Clay search.")
@@ -2040,237 +2275,42 @@ if active_page == "Campaigns":
                     st.error(f"Latest Clay contact search failed: {latest_people_run['error_message']}")
                     with st.expander("Clay contact search query sent"):
                         st.code(latest_people_run["query_text"], language="sql")
-            # Native popup confirmation keeps all three actions in the first fold.
+            # Delete is the only campaign action that requires confirmation.
             pending_action = st.session_state.get("pending_campaign_action")
             pending_action_id = st.session_state.get("pending_campaign_action_id")
-            if pending_action and pending_action_id == selected_id:
-                show_campaign_action_dialog(
-                    pending_action,
-                    selected_id,
-                    selected_name,
-                )
+            if pending_action == "delete" and pending_action_id == selected_id:
+                show_campaign_delete_dialog(selected_id, selected_name)
 
             if (
                 st.session_state.get("campaign_action_confirmed")
                 and st.session_state.get("campaign_action_confirmed_id") == selected_id
+                and pending_action == "delete"
                 and pending_action_id == selected_id
             ):
-                if pending_action == "edit":
-                    st.session_state["editing_campaign_id"] = selected_id
-                    log_activity("Edit opened", selected_id, selected_name, selected_owner)
-                    st.session_state.pop("pending_campaign_action", None)
-                    st.session_state.pop("pending_campaign_action_id", None)
-                    st.rerun()
-                elif pending_action == "duplicate":
-                    new_id = str(uuid.uuid4())
-                    new_name = selected_name + " (Copy)"
-                    duplicate_owner = selected_owner if is_mock_admin else current_mock_user_name
-                    conn.execute(
-                        """
-                        INSERT INTO campaigns
-                        (id, name, industry, company_country, contact_country, target_titles,
-                         min_score, status, created_at, current_cms, department, seniority,
-                         job_level, email_sequence_instructions, clay_table_url, campaign_owner)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            new_id,
-                            new_name,
-                            selected_row["industry"] or "",
-                            selected_row["company_country"] or "",
-                            selected_row["contact_country"] or "",
-                            selected_row["target_titles"] or "",
-                            int(selected_row["min_score"]),
-                            "Draft",
-                            datetime.now().isoformat(timespec="seconds"),
-                            selected_row.get("current_cms", "") or "",
-                            selected_row.get("department", "") or "",
-                            selected_row.get("seniority", "Manager") or "Manager",
-                            selected_row.get("job_level", "Above") or "Above",
-                            selected_row.get("email_sequence_instructions", "") or "",
-                            "",  # A duplicate starts without the original Clay table URL.
-                            duplicate_owner,
-                        ),
-                    )
-                    conn.commit()
-                    log_activity(
-                        "Campaign duplicated",
-                        new_id,
-                        new_name,
-                        duplicate_owner,
-                        f"Duplicated from campaign: {selected_name}",
-                    )
-                    st.session_state["overview_campaign"] = new_id
-                    st.session_state["_force_campaign_selection"] = new_id
-                    st.session_state["_reset_campaign_preview_widget"] = True
-                    st.session_state["editing_campaign_id"] = new_id
-                    st.session_state["campaign_edit_context"] = "duplicate"
-                    st.session_state.pop("pending_campaign_action", None)
-                    st.session_state.pop("pending_campaign_action_id", None)
-                    st.rerun()
-                elif pending_action == "delete":
-                    log_activity(
-                        "Campaign deleted",
-                        selected_id,
-                        selected_name,
-                        selected_owner,
-                        "Campaign and its locally stored Clay search results deleted.",
-                    )
-                    conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
-                    conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (selected_id,))
-                    conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (selected_id,))
-                    conn.execute("DELETE FROM campaigns WHERE id = ?", (selected_id,))
-                    conn.commit()
-                    remaining_ids = [item for item in campaign_ids if item != selected_id]
-                    st.session_state.pop("pending_campaign_action", None)
-                    st.session_state.pop("pending_campaign_action_id", None)
-                    st.session_state.pop("editing_campaign_id", None)
-                    st.session_state["campaign_delete_notice"] = "Campaign and its locally stored search results have been deleted."
-                    st.session_state.pop("overview_campaign", None)
-                    st.session_state.pop("_force_campaign_selection", None)
-                    st.session_state["_reset_campaign_preview_widget"] = True
-                    st.rerun()
-
+                log_activity(
+                    "Campaign deleted",
+                    selected_id,
+                    selected_name,
+                    selected_owner,
+                    "Campaign and its locally stored Clay search results deleted.",
+                )
+                conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
+                conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (selected_id,))
+                conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (selected_id,))
+                conn.execute("DELETE FROM campaigns WHERE id = ?", (selected_id,))
+                conn.commit()
+                st.session_state.pop("pending_campaign_action", None)
+                st.session_state.pop("pending_campaign_action_id", None)
                 st.session_state.pop("campaign_action_confirmed", None)
                 st.session_state.pop("campaign_action_confirmed_id", None)
-
-            # The same criteria editor is used for normal edits and newly duplicated campaigns.
-            if st.session_state.get("editing_campaign_id") == selected_id and selected_permission in ("Owner", "Can Edit"):
-                st.markdown("#### Edit Campaign Criteria")
-                st.caption(
-                    "Update the criteria for this campaign. A duplicated campaign is independent "
-                    "of its original campaign."
+                st.session_state.pop("editing_campaign_id", None)
+                st.session_state["campaign_delete_notice"] = (
+                    "Campaign and its locally stored search results have been deleted."
                 )
-                saved_seniority = [
-                    value.strip()
-                    for value in str(selected_row["seniority"] or "Manager").split(",")
-                    if value.strip() in SENIORITY_OPTIONS
-                ] or ["Manager"]
-
-                with st.form(f"edit_campaign_form_{selected_id}"):
-                    edit_name = st.text_input("Campaign Name", value=str(selected_row["name"] or ""))
-                    edit_owner = st.text_input(
-                        "Campaign Owner",
-                        value=str(selected_row.get("campaign_owner", "Unassigned") or "Unassigned"),
-                    )
-                    edit_industry = st.text_input(
-                        "Industry",
-                        value=str(selected_row["industry"] or ""),
-                        help="Enter multiple industries separated by commas, e.g. Pharmaceuticals, Retail.",
-                    )
-                    edit_company_country = st.text_input(
-                        "Company Country",
-                        value=str(selected_row["company_country"] or ""),
-                        help="Multiple countries are allowed, e.g. United Kingdom, Germany.",
-                    )
-                    edit_contact_country = st.text_input(
-                        "Contact Country",
-                        value=str(selected_row["contact_country"] or ""),
-                        help="Multiple countries are allowed, e.g. United Kingdom, Germany.",
-                    )
-                    edit_target_titles = st.text_input(
-                        "Job Titles",
-                        value=str(selected_row["target_titles"] or ""),
-                        help="Enter several titles separated by commas, e.g. CMO, Marketing Director, Head of Marketing.",
-                    )
-                    edit_current_cms = st.text_input(
-                        "Current CMS",
-                        value=str(selected_row["current_cms"] or ""),
-                        help="Multiple CMS platforms are allowed, e.g. WordPress, Drupal, Sitecore.",
-                    )
-                    edit_department = st.text_input(
-                        "Department",
-                        value=str(selected_row["department"] or ""),
-                        help="Multiple departments are allowed, e.g. Marketing, Sales.",
-                    )
-                    edit_seniority = st.multiselect(
-                        "Seniority",
-                        SENIORITY_OPTIONS,
-                        default=saved_seniority,
-                        help="Select one or more seniority levels.",
-                    )
-                    current_job_level = str(selected_row.get("job_level", "Above") or "Above")
-                    if current_job_level not in JOB_LEVEL_OPTIONS:
-                        current_job_level = "Above"
-                    edit_job_level = st.selectbox(
-                        "Job Level",
-                        JOB_LEVEL_OPTIONS,
-                        index=JOB_LEVEL_OPTIONS.index(current_job_level),
-                        help=(
-                            "Above includes the selected level(s) and higher. Below includes "
-                            "the selected level(s) and lower. Exact matches only selected levels."
-                        ),
-                    )
-                    edit_min_score = st.slider(
-                        "Minimum company and contact ICP score",
-                        min_value=0,
-                        max_value=100,
-                        value=int(selected_row["min_score"]),
-                    )
-                    edit_email_instructions = st.text_area(
-                        "Email Sequence Instructions",
-                        value=str(selected_row.get("email_sequence_instructions", "") or ""),
-                        height=150,
-                    )
-                    edit_clay_table_url = st.text_input(
-                        "Clay Table Link (optional)",
-                        value=str(selected_row.get("clay_table_url", "") or ""),
-                        placeholder="Paste the Clay table URL here when available",
-                        help="Optional reference link to a Clay table created separately. The Public Search API does not create tables.",
-                    )
-                    save_changes = st.form_submit_button("Save Changes", type="primary")
-
-                if save_changes:
-                    if not edit_name.strip():
-                        st.error("Please enter a campaign name.")
-                    elif not edit_seniority and edit_job_level != "Any":
-                        st.error("Select at least one seniority level, or choose Job Level = Any.")
-                    else:
-                        owner_value = edit_owner.strip() or "Unassigned"
-                        conn.execute(
-                            """
-                            UPDATE campaigns
-                            SET name = ?, campaign_owner = ?, industry = ?, company_country = ?,
-                                contact_country = ?, target_titles = ?, min_score = ?, current_cms = ?,
-                                department = ?, seniority = ?, job_level = ?,
-                                email_sequence_instructions = ?, clay_table_url = ?, status = ?,
-                                criteria_approved = 0, criteria_approved_by = '', criteria_approved_at = ''
-                            WHERE id = ?
-                            """,
-                            (
-                                edit_name.strip(), owner_value, edit_industry.strip(),
-                                edit_company_country.strip(), edit_contact_country.strip(),
-                                edit_target_titles.strip(), int(edit_min_score), edit_current_cms.strip(),
-                                edit_department.strip(), ", ".join(edit_seniority), edit_job_level,
-                                edit_email_instructions.strip(), edit_clay_table_url.strip(),
-                                "Draft", selected_id,
-                            ),
-                        )
-
-                        # Criteria edits invalidate the previous approval and old search results.
-                        conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (selected_id,))
-                        conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (selected_id,))
-                        conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
-                        conn.commit()
-                        log_activity(
-                            "Campaign criteria updated", selected_id, edit_name.strip(), owner_value,
-                            "Criteria changed. Previous approval and Clay search results were cleared; approve the updated criteria before searching again.",
-                        )
-                        st.session_state["campaign_edit_notice"] = (
-                            "Campaign updated. Please approve the revised criteria before running a new Clay search."
-                        )
-
-                        st.session_state["active_campaign_id"] = selected_id
-                        st.session_state["run_campaign_selector"] = selected_id
-                        st.session_state["lead_campaign_selector"] = selected_id
-                        st.session_state["editing_campaign_id"] = None
-                        st.session_state.pop("campaign_edit_context", None)
-                        st.rerun()
-
-                if st.button("Cancel Editing", key=f"cancel_campaign_editor_{selected_id}"):
-                    st.session_state["editing_campaign_id"] = None
-                    st.session_state.pop("campaign_edit_context", None)
-                    st.rerun()
+                st.session_state.pop("overview_campaign", None)
+                st.session_state.pop("_force_campaign_selection", None)
+                st.session_state["_reset_campaign_preview_widget"] = True
+                st.rerun()
 
 
 elif active_page == "Review & Approvals":
