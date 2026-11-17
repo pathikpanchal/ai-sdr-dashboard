@@ -271,7 +271,7 @@ def get_connection():
         "id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, clay_search_id TEXT DEFAULT '', "
         "query_text TEXT NOT NULL, result_count INTEGER NOT NULL DEFAULT 0, "
         "has_more INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, "
-        "error_message TEXT DEFAULT '', created_at TEXT NOT NULL)"
+        "error_message TEXT DEFAULT '', debug_json TEXT DEFAULT '', created_at TEXT NOT NULL)"
     )
     connection.execute(
         "CREATE TABLE IF NOT EXISTS clay_people_results ("
@@ -295,6 +295,7 @@ def get_connection():
             has_more INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             error_message TEXT DEFAULT '',
+            debug_json TEXT DEFAULT '',
             created_at TEXT NOT NULL
         )
         """
@@ -341,6 +342,9 @@ def get_connection():
         },
         "clay_company_results": {
             "company_linkedin_url": "TEXT DEFAULT ''",
+        },
+        "clay_people_search_runs": {
+            "debug_json": "TEXT DEFAULT ''",
         },
         "clay_people_results": {
             "first_name": "TEXT DEFAULT ''",
@@ -1127,26 +1131,81 @@ def _first_nonempty(mapping, *keys):
     return ""
 
 
+def _truthy_current_marker(value):
+    if value is True or value == 1:
+        return True
+    return str(value or "").strip().casefold() in ("true", "yes", "1", "current", "present")
+
+
 def _extract_current_experience(row):
-    experiences = _first_nonempty(row, "experiences", "experience", "employment_history", "employmentHistory")
-    if not experiences:
-        current_exp = _first_nonempty(row, "current_experience", "currentExperience")
-        if isinstance(current_exp, dict):
-            experiences = [current_exp]
+    """Return the best-supported current role from Clay's profile payload."""
+    # Clay may provide a dedicated current_experience object alongside a full
+    # experiences list. Prefer that explicit object instead of ignoring it.
+    current_exp = _first_nonempty(row, "current_experience", "currentExperience")
+    if isinstance(current_exp, dict):
+        return current_exp
+    if isinstance(current_exp, list):
+        current_exp = next((item for item in current_exp if isinstance(item, dict)), None)
+        if current_exp:
+            return current_exp
+
+    experiences = _first_nonempty(
+        row, "experiences", "experience", "employment_history", "employmentHistory"
+    )
     if isinstance(experiences, dict):
         experiences = [experiences]
     if not isinstance(experiences, list):
         return {}
+    valid_experiences = [item for item in experiences if isinstance(item, dict)]
+
     current = next(
-        (item for item in experiences if isinstance(item, dict) and (
-            item.get("is_current") is True or item.get("isCurrent") is True or item.get("current") is True
-            or item.get("is_current_role") is True or item.get("isCurrentRole") is True
-        )),
+        (
+            item for item in valid_experiences
+            if any(_truthy_current_marker(item.get(key)) for key in (
+                "is_current", "isCurrent", "current", "is_current_role", "isCurrentRole"
+            ))
+        ),
         None,
     )
-    # Do not assume the first item is current: employment histories are often
-    # newest-first but may include former roles without an explicit current flag.
-    return current or {}
+    if current:
+        return current
+
+    # Some Clay payloads omit the boolean current flag but explicitly include
+    # an empty end-date field or a Present/Current end date. Treat that as a
+    # current-role signal; do not infer current status merely from list order.
+    end_date_keys = ("end_date", "endDate", "ends_at", "endsAt", "to", "ended_at", "endedAt")
+    for item in valid_experiences:
+        present_end_key = next((key for key in end_date_keys if key in item), None)
+        if present_end_key is None:
+            continue
+        end_value = item.get(present_end_key)
+        if end_value in (None, "", {}, []) or str(end_value).strip().casefold() in ("present", "current"):
+            return item
+    return {}
+
+
+def _extract_person_job_title(row, experience):
+    """Choose the current role title before generic profile headlines."""
+    candidates = [
+        ("current_experience", _first_nonempty(experience, "title", "job_title", "jobTitle", "position", "role")),
+        ("current_job_title", _first_nonempty(row, "current_job_title", "currentJobTitle")),
+        ("job_title", _first_nonempty(row, "job_title", "jobTitle")),
+        ("title", _first_nonempty(row, "title")),
+        ("headline", _first_nonempty(row, "headline")),
+    ]
+    normalized = []
+    seen = set()
+    for source, value in candidates:
+        if value in (None, "", [], {}):
+            continue
+        text_value = str(value).strip()
+        if not text_value or text_value.casefold() in seen:
+            continue
+        seen.add(text_value.casefold())
+        normalized.append((source, text_value))
+    if normalized:
+        return normalized[0][1], normalized[0][0], [value for _, value in normalized]
+    return "", "unavailable", []
 
 
 def _parse_clay_person_row(row):
@@ -1214,13 +1273,17 @@ def _parse_clay_person_row(row):
         or _first_nonempty(company, "linkedin_url", "linkedinUrl", "social_url", "profile_url", "url")
         or _first_nonempty(top_company, "linkedin_url", "linkedinUrl", "social_url", "profile_url", "url")
     )
+    job_title, job_title_source, title_candidates = _extract_person_job_title(row, experience)
 
     return {
         "clay_profile_id": str(_first_nonempty(row, "clay_profile_id", "clayProfileId", "id", "profile_id", "profileId") or ""),
         "full_name": str(full_name or ""),
         "first_name": str(first_name or ""),
         "last_name": str(last_name or ""),
-        "job_title": str(_first_nonempty(row, "job_title", "jobTitle", "title", "headline") or _first_nonempty(experience, "title", "job_title", "jobTitle") or ""),
+        "job_title": job_title,
+        "job_title_source": job_title_source,
+        "title_candidates": title_candidates,
+        "has_current_experience": bool(experience),
         "seniority": str(seniority or ""),
         "department": str(department or ""),
         "location": str(location_text or ""),
@@ -1313,18 +1376,31 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
         rejected_count = 0
         rejected_title_count = 0
         unverified_employer_count = 0
+        profiles_with_title = 0
+        profiles_with_current_experience = 0
+        rejected_title_samples = []
         requested_title_keywords = [
             value.casefold() for value in split_clay_values(campaign.get("target_titles", ""))
             if value.casefold() not in ("any", "all")
         ]
         for raw_row in raw_rows:
             person = _parse_clay_person_row(raw_row)
-            # Enforce the dashboard's intended "Contains" title behaviour even
-            # when the current Clay API schema does not expose job_title_mode.
+            profiles_with_title += int(bool(person["job_title"]))
+            profiles_with_current_experience += int(person["has_current_experience"])
+            # The parser now prioritizes the current role over a generic headline.
+            # Keep this local check as a safety check against mismatched results.
             if requested_title_keywords and not any(
                 keyword in person["job_title"].casefold() for keyword in requested_title_keywords
             ):
                 rejected_title_count += 1
+                if len(rejected_title_samples) < 10:
+                    rejected_title_samples.append({
+                        "parsed_title": person["job_title"],
+                        "title_source": person["job_title_source"],
+                        "available_title_fields": person["title_candidates"],
+                        "has_current_experience": person["has_current_experience"],
+                        "top_level_keys": sorted(str(key) for key in raw_row.keys()) if isinstance(raw_row, dict) else [],
+                    })
                 continue
             current_ids = {
                 _normalize_company_match_identifier(person["company_linkedin_url"]),
@@ -1345,12 +1421,30 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
             if len(rows) >= 50:
                 break
 
+        diagnostic_data = {
+            "raw_profile_count": len(raw_rows),
+            "retained_profile_count": len(rows),
+            "requested_title_keywords": requested_title_keywords,
+            "title_filter_rejected_count": rejected_title_count,
+            "employer_mismatch_rejected_count": rejected_count,
+            "retained_without_employer_identifier_count": unverified_employer_count,
+            "profiles_with_parsed_title_count": profiles_with_title,
+            "profiles_with_current_experience_count": profiles_with_current_experience,
+            "rejected_title_samples": rejected_title_samples,
+        }
+        diagnostic_json = json.dumps(diagnostic_data, ensure_ascii=False)
+        run_summary = (
+            f"Clay returned {len(raw_rows)} profiles (maximum 50 for this search); "
+            f"retained {len(rows)}; excluded {rejected_title_count} outside the requested title keywords "
+            f"and {rejected_count} with a conflicting employer identifier; "
+            f"retained {unverified_employer_count} without employer identifiers under the company-scoped search."
+        )
         conn.execute(
             """INSERT INTO clay_people_search_runs
-               (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, debug_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete",
-             f"Clay returned {len(raw_rows)} profiles (maximum 50 for this search); excluded {rejected_title_count} outside the requested title keywords and {rejected_count} with a conflicting employer identifier; retained {unverified_employer_count} without employer identifiers under the company-scoped search.", created_at),
+             run_summary, diagnostic_json, created_at),
         )
 
         for raw_row, person in rows:
@@ -2459,6 +2553,27 @@ if active_page == "Campaigns":
                     )
                     with st.expander("Clay contact search query sent"):
                         st.code(latest_people_run["query_text"], language="sql")
+                    debug_text = latest_people_run.get("debug_json", "")
+                    if debug_text:
+                        try:
+                            contact_debug = json.loads(debug_text)
+                        except (TypeError, ValueError):
+                            contact_debug = {}
+                        if contact_debug:
+                            with st.expander("Contact search diagnostics"):
+                                st.write({
+                                    "Raw profiles received from Clay": contact_debug.get("raw_profile_count", 0),
+                                    "Profiles with a parsed job title": contact_debug.get("profiles_with_parsed_title_count", 0),
+                                    "Profiles with a detected current role": contact_debug.get("profiles_with_current_experience_count", 0),
+                                    "Rejected by local title check": contact_debug.get("title_filter_rejected_count", 0),
+                                    "Rejected for conflicting employer": contact_debug.get("employer_mismatch_rejected_count", 0),
+                                })
+                                st.caption("Sample rejected title fields (names, emails and phone numbers are not included):")
+                                rejected_samples = contact_debug.get("rejected_title_samples", [])
+                                if rejected_samples:
+                                    st.dataframe(pd.DataFrame(rejected_samples), use_container_width=True, hide_index=True)
+                                else:
+                                    st.caption("No profiles were rejected by the local title check.")
                 else:
                     st.error(f"Latest Clay contact search failed: {latest_people_run['error_message']}")
                     with st.expander("Clay contact search query sent"):
