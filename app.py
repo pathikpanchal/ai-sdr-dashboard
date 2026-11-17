@@ -14,6 +14,7 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 APP_DIR = Path(__file__).parent
 DB_PATH = APP_DIR / "ai_sdr.db"
@@ -878,22 +879,45 @@ def run_clay_company_search(campaign, campaign_id, api_key):
             ("Company Search Complete" if rows else "No Companies Found", campaign_id),
         )
         conn.commit()
+        company_linkedin_urls = list(dict.fromkeys(
+            str(value).strip()
+            for row in rows
+            for value in [
+                row.get("linkedin_url") or row.get("company_linkedin_url")
+                or row.get("linkedin_url_company") or row.get("social_url")
+            ]
+            if str(value or "").strip()
+        ))
+        company_domains = list(dict.fromkeys(
+            str(row.get("domain", "")).strip().lower()
+            for row in rows if str(row.get("domain", "")).strip()
+        ))
+        # Prefer LinkedIn company URLs for Clay's account matching. Use a domain
+        # only for companies that do not have a LinkedIn company URL.
+        rows_without_linkedin = [
+            row for row in rows
+            if not str(
+                row.get("linkedin_url") or row.get("company_linkedin_url")
+                or row.get("linkedin_url_company") or row.get("social_url") or ""
+            ).strip()
+        ]
+        fallback_domains = list(dict.fromkeys(
+            str(row.get("domain", "")).strip().lower()
+            for row in rows_without_linkedin if str(row.get("domain", "")).strip()
+        ))
+        company_identifiers = list(dict.fromkeys(company_linkedin_urls + fallback_domains))
+        company_match_identifiers = list(dict.fromkeys(company_linkedin_urls + company_domains))
+
         return {
             "run_id": run_id,
             "search_id": clay_search_id,
             "query": query_text,
             "count": len(rows),
             "has_more": has_more,
-            "company_domains": list(dict.fromkeys(
-                str(row.get("domain", "")).strip().lower()
-                for row in rows if str(row.get("domain", "")).strip()
-            )),
-            "company_identifiers": list(dict.fromkeys(
-                str(value).strip()
-                for row in rows
-                for value in [row.get("linkedin_url") or row.get("company_linkedin_url") or row.get("social_url") or row.get("domain")]
-                if str(value or "").strip()
-            )),
+            "company_domains": company_domains,
+            "company_linkedin_urls": company_linkedin_urls,
+            "company_identifiers": company_identifiers,
+            "company_match_identifiers": company_match_identifiers,
         }
     except Exception as exc:
         existing_run = conn.execute("SELECT 1 FROM clay_search_runs WHERE id = ?", (run_id,)).fetchone()
@@ -934,36 +958,113 @@ def fetch_clay_people_filter_schema(api_key):
 
 
 def _clay_filter_values(schema_field, values, label):
-    """Return only values accepted by a controlled Clay field; preserve free text."""
+    """Map requested values to Clay's live controlled vocabulary when available."""
     values = [str(value).strip() for value in values if str(value).strip()]
     allowed = schema_field.get("allowed_values") or schema_field.get("allowedValues") or []
     if not allowed:
         return values
-    allowed_lookup = {str(value).casefold(): str(value) for value in allowed}
-    mapped = [allowed_lookup[value.casefold()] for value in values if value.casefold() in allowed_lookup]
-    if values and not mapped:
+
+    # Clay schemas may expose allowed values as strings or small value objects.
+    allowed_strings = []
+    for item in allowed:
+        if isinstance(item, dict):
+            item = item.get("value") or item.get("name") or item.get("label") or item.get("id")
+        if item not in (None, ""):
+            allowed_strings.append(str(item))
+    allowed_lookup = {value.casefold(): value for value in allowed_strings}
+    mapped = []
+    missing = []
+    for value in values:
+        canonical = allowed_lookup.get(value.casefold())
+        if canonical:
+            if canonical not in mapped:
+                mapped.append(canonical)
+        else:
+            missing.append(value)
+    if missing:
+        examples = ", ".join(allowed_strings[:15])
         raise ValueError(
-            f"Your {label} value ({', '.join(values)}) does not match Clay's current options. "
-            f"Supported examples: {', '.join(str(v) for v in allowed[:12])}"
+            f"Your {label} value(s) ({', '.join(missing)}) do not match Clay's current options. "
+            f"Supported examples: {examples or 'not provided by Clay'}"
         )
     return mapped
 
 
+def _expand_seniority_for_job_level(campaign):
+    """Translate the UI's seniority + Above/Below/Exact setting into Clay levels."""
+    selected_labels = split_clay_values(campaign.get("seniority", ""))
+    if not selected_labels:
+        return []
+
+    # Ordered from most junior to most senior. Above includes the selected
+    # level(s) and all levels above them; Below includes selected and below.
+    # Clay's documented people seniority vocabulary. For an "Above" selection,
+    # include the selected level and every more-senior level. Partner and
+    # board-member are also above Head in Clay's hierarchy.
+    rank_groups = [
+        (1, ["manager"]),
+        (2, ["head"]),
+        (3, ["director"]),
+        (4, ["vp"]),
+        (5, ["c-suite"]),
+        (6, ["partner"]),
+        (7, ["owner", "founder"]),
+        (8, ["board-member"]),
+    ]
+    label_to_values = {
+        "manager": ["manager"],
+        "head": ["head"],
+        "director": ["director"],
+        "vp": ["vp"],
+        "c-suite": ["c-suite"],
+        "owner / founder": ["owner", "founder"],
+        "owner": ["owner"],
+        "founder": ["founder"],
+    }
+
+    selected_values = []
+    for label in selected_labels:
+        key = label.casefold().strip()
+        mapped = label_to_values.get(key)
+        if not mapped:
+            raise ValueError(f"Unsupported seniority selection: {label}")
+        selected_values.extend(mapped)
+    selected_values = list(dict.fromkeys(selected_values))
+
+    level = str(campaign.get("job_level", "Any") or "Any").strip().casefold()
+    if level in ("", "any"):
+        return []
+    if level == "exact":
+        return selected_values
+
+    selected_ranks = [
+        rank for rank, values in rank_groups
+        if set(values).intersection(selected_values)
+    ]
+    if not selected_ranks:
+        return selected_values
+
+    if level == "above":
+        threshold = min(selected_ranks)
+        return [value for rank, values in rank_groups if rank >= threshold for value in values]
+    if level == "below":
+        threshold = max(selected_ranks)
+        return [value for rank, values in rank_groups if rank <= threshold for value in values]
+    return selected_values
+
+
 def build_clay_people_filters(campaign, company_identifiers, people_schema):
-    """Build people filters using the exact target-company identifiers from this run."""
+    """Build Clay people filters, applying title, seniority, location and account scope."""
     if not company_identifiers:
         raise ValueError("No company LinkedIn URLs or domains were returned, so contact search cannot be safely scoped.")
 
     filters = {}
-
-    # Clay's Search API supports a company_identifier filter for people search.
-    # Use LinkedIn company URLs first, falling back to domains only if unavailable.
     if "company_identifier" not in people_schema:
         raise RuntimeError(
             "Clay's live people-search schema does not expose company_identifier. "
             "The dashboard stopped rather than running an unscoped contact search."
         )
-    filters["company_identifier"] = company_identifiers
+    filters["company_identifier"] = list(dict.fromkeys(company_identifiers))
 
     contact_countries = [
         normalize_country_name(value).title()
@@ -978,44 +1079,40 @@ def build_clay_people_filters(campaign, company_identifiers, people_schema):
         )
 
     title_values = split_clay_values(campaign.get("target_titles", ""))
-    if title_values and not any(v.casefold() == "any" for v in title_values):
+    if title_values and not any(value.casefold() in ("any", "all") for value in title_values):
         field = people_schema.get("job_title_keywords")
         if not field:
             raise RuntimeError("Clay's current people-search schema does not expose job_title_keywords.")
-        filters["job_title_keywords"] = _clay_filter_values(field, title_values, "Job Titles")
+        # This is a free-text keyword filter in Clay. Keep each keyword as a
+        # separate list item; Clay's schema does not provide a controlled list.
+        filters["job_title_keywords"] = [value.casefold() for value in title_values]
+        # The API exposes the match mode on some schema versions. Use literal
+        # substring matching when Clay advertises that field; otherwise the
+        # result processor below enforces the same contains behaviour locally.
+        if "job_title_mode" in people_schema:
+            filters["job_title_mode"] = _clay_filter_values(
+                people_schema["job_title_mode"], ["contain"], "Job Title Match Mode"
+            )
 
-    seniority_value = str(campaign.get("seniority", "") or "").strip()
-    if seniority_value and seniority_value.casefold() not in ("any", "all"):
+    seniority_values = _expand_seniority_for_job_level(campaign)
+    if seniority_values:
         field = people_schema.get("job_title_seniority_levels_v2")
         if not field:
             raise RuntimeError("Clay's current people-search schema does not expose job_title_seniority_levels_v2.")
-        seniority_aliases = {
-            "c-suite": ["c-suite"],
-            "c suite": ["c-suite"],
-            "executive": ["c-suite"],
-            "vp": ["vp"],
-            "vice president": ["vp"],
-            "director": ["director"],
-            "head": ["head"],
-            "manager": ["manager"],
-        }
-        requested = seniority_aliases.get(seniority_value.casefold(), [seniority_value])
         filters["job_title_seniority_levels_v2"] = _clay_filter_values(
-            field, requested, "Seniority"
+            field, seniority_values, "Seniority / Job Level"
         )
 
-    department_value = str(campaign.get("department", "") or "").strip()
-    if department_value and department_value.casefold() not in ("any", "all"):
+    department_values = split_clay_values(campaign.get("department", ""))
+    department_values = [value for value in department_values if value.casefold() not in ("any", "all")]
+    if department_values:
         field = people_schema.get("job_functions")
-        if field:
-            filters["job_functions"] = _clay_filter_values(
-                field, [department_value], "Department"
-            )
-        else:
+        if not field:
             raise RuntimeError(
                 "Clay's current people-search schema does not expose job_functions, "
                 "so the requested Department filter cannot be safely applied."
             )
+        filters["job_functions"] = _clay_filter_values(field, department_values, "Department")
 
     return filters
 
@@ -1043,18 +1140,26 @@ def _extract_current_experience(row):
     current = next(
         (item for item in experiences if isinstance(item, dict) and (
             item.get("is_current") is True or item.get("isCurrent") is True or item.get("current") is True
+            or item.get("is_current_role") is True or item.get("isCurrentRole") is True
         )),
         None,
     )
-    return current or (experiences[0] if experiences and isinstance(experiences[0], dict) else {})
+    # Do not assume the first item is current: employment histories are often
+    # newest-first but may include former roles without an explicit current flag.
+    return current or {}
 
 
 def _parse_clay_person_row(row):
     """Normalize Clay's returned profile fields across snake_case/camelCase shapes."""
     experience = _extract_current_experience(row)
-    company = _first_nonempty(experience, "company", "organization", "current_company", "currentCompany")
+    company = _first_nonempty(
+        experience, "company", "organization", "current_company", "currentCompany"
+    )
     if not isinstance(company, dict):
         company = {}
+    top_company = _first_nonempty(row, "company", "current_company", "currentCompany", "employer")
+    if not isinstance(top_company, dict):
+        top_company = {}
     location = _first_nonempty(row, "location", "person_location", "personLocation")
     if isinstance(location, dict):
         location_text = _first_nonempty(location, "name", "display_name", "displayName", "formatted")
@@ -1089,6 +1194,27 @@ def _parse_clay_person_row(row):
     if isinstance(department, list):
         department = ", ".join(str(value) for value in department)
 
+    company_name = (
+        _first_nonempty(row, "company_name", "companyName", "current_company_name", "currentCompanyName")
+        or _first_nonempty(company, "name", "company_name", "companyName")
+        or _first_nonempty(top_company, "name", "company_name", "companyName")
+    )
+    company_domain = (
+        _first_nonempty(row, "company_domain", "companyDomain", "current_company_domain", "currentCompanyDomain")
+        or _first_nonempty(experience, "company_domain", "companyDomain")
+        or _first_nonempty(company, "domain", "website", "company_domain", "companyDomain")
+        or _first_nonempty(top_company, "domain", "website", "company_domain", "companyDomain")
+    )
+    company_linkedin_url = (
+        _first_nonempty(
+            row, "company_linkedin_url", "companyLinkedinUrl", "current_company_linkedin_url",
+            "currentCompanyLinkedinUrl", "company_social_url", "companySocialUrl",
+        )
+        or _first_nonempty(experience, "company_linkedin_url", "companyLinkedinUrl", "company_social_url")
+        or _first_nonempty(company, "linkedin_url", "linkedinUrl", "social_url", "profile_url", "url")
+        or _first_nonempty(top_company, "linkedin_url", "linkedinUrl", "social_url", "profile_url", "url")
+    )
+
     return {
         "clay_profile_id": str(_first_nonempty(row, "clay_profile_id", "clayProfileId", "id", "profile_id", "profileId") or ""),
         "full_name": str(full_name or ""),
@@ -1099,17 +1225,36 @@ def _parse_clay_person_row(row):
         "department": str(department or ""),
         "location": str(location_text or ""),
         "location_country": str(location_country or ""),
-        "company_name": str(_first_nonempty(row, "company_name", "companyName") or _first_nonempty(company, "name", "company_name", "companyName") or ""),
-        "company_domain": str(_first_nonempty(row, "company_domain", "companyDomain") or _first_nonempty(company, "domain", "website", "company_domain") or ""),
-        "company_linkedin_url": str(_first_nonempty(row, "company_linkedin_url", "companyLinkedinUrl", "current_company_linkedin_url", "currentCompanyLinkedinUrl", "company_social_url") or _first_nonempty(company, "linkedin_url", "linkedinUrl", "social_url", "url", "profile_url") or ""),
+        "company_name": str(company_name or ""),
+        "company_domain": str(company_domain or ""),
+        "company_linkedin_url": str(company_linkedin_url or ""),
         "linkedin_url": str(_first_nonempty(row, "linkedin_url", "linkedinUrl", "profile_url", "profileUrl", "linkedInUrl") or ""),
     }
 
 
-def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers):
+def _normalize_company_match_identifier(value):
+    """Normalize a company domain or LinkedIn company URL for safe comparison."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = raw if "://" in raw else "https://" + raw
+    parsed = urlparse(candidate)
+    host = (parsed.netloc or "").casefold().removeprefix("www.")
+    path = (parsed.path or "").rstrip("/").casefold()
+    if "linkedin.com" in host:
+        return host + path
+    return host or raw.casefold().removeprefix("www.").rstrip("/")
+
+
+def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, company_match_identifiers=None):
     """Search people at the exact companies from the preceding company-search run."""
+    # Reload the saved campaign immediately before constructing filters. This
+    # prevents a stale in-memory campaign object from dropping the saved Job
+    # Level operator (e.g. Head + Above) from the Clay request.
+    campaign = campaign_as_dict(campaign_id) or campaign
     people_schema = fetch_clay_people_filter_schema(api_key)
     filters = build_clay_people_filters(campaign, company_identifiers, people_schema)
+    match_values = company_match_identifiers or company_identifiers
     query_text = json.dumps(
         {"source_type": "people", "filters": filters},
         ensure_ascii=False,
@@ -1137,44 +1282,91 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers):
         if not clay_search_id:
             raise RuntimeError("Clay did not return a contact search ID.")
 
-        results_response = requests.post(
-            f"{base_url}/search/filters-mode/{clay_search_id}/run",
-            headers=headers,
-            json={"limit": 50},
-            timeout=45,
-        )
-        if not results_response.ok:
-            raise RuntimeError(
-                f"Clay contact results request failed (HTTP {results_response.status_code}): "
-                f"{results_response.text[:1000]}"
+        # Pull additional pages when necessary because the local title and
+        # employer checks can reject records from a broad API result page.
+        # Stop after 10 pages (up to 500 raw profiles) or when Clay is exhausted.
+        raw_rows = []
+        seen_profile_ids = set()
+        has_more = False
+        for _page_number in range(10):
+            results_response = requests.post(
+                f"{base_url}/search/filters-mode/{clay_search_id}/run",
+                headers=headers,
+                json={"limit": 50},
+                timeout=45,
             )
-        payload = results_response.json()
-        raw_rows = payload.get("data", []) or []
-        has_more = bool(payload.get("has_more", False))
+            if not results_response.ok:
+                raise RuntimeError(
+                    f"Clay contact results request failed (HTTP {results_response.status_code}): "
+                    f"{results_response.text[:1000]}"
+                )
+            page_payload = results_response.json()
+            page_rows = page_payload.get("data", []) or []
+            has_more = bool(page_payload.get("has_more", False))
+            added = 0
+            for page_row in page_rows:
+                profile_id = str(_first_nonempty(
+                    page_row, "clay_profile_id", "clayProfileId", "id", "profile_id", "profileId"
+                ) or json.dumps(page_row, sort_keys=True))
+                if profile_id in seen_profile_ids:
+                    continue
+                seen_profile_ids.add(profile_id)
+                raw_rows.append(page_row)
+                added += 1
+            if not has_more or not page_rows or added == 0:
+                break
+        # A dashboard run stores at most 50 qualified contacts, not merely the
+        # first 50 unfiltered Clay profiles.
 
-        # Defense in depth: only accept profiles whose returned current employer
-        # matches a company identifier from this campaign's preceding company search.
-        approved_ids = {str(value).strip().casefold().rstrip("/") for value in company_identifiers}
+        # Defense in depth: compare the current employer against BOTH LinkedIn
+        # URLs and domains returned by the company search. The API search itself
+        # is already scoped by company_identifier (LinkedIn URL preferred).
+        approved_ids = {
+            _normalize_company_match_identifier(value)
+            for value in match_values if _normalize_company_match_identifier(value)
+        }
         rows = []
         rejected_count = 0
+        rejected_title_count = 0
+        unverified_employer_count = 0
+        requested_title_keywords = [
+            value.casefold() for value in split_clay_values(campaign.get("target_titles", ""))
+            if value.casefold() not in ("any", "all")
+        ]
         for raw_row in raw_rows:
             person = _parse_clay_person_row(raw_row)
+            # Enforce the dashboard's intended "Contains" title behaviour even
+            # when the current Clay API schema does not expose job_title_mode.
+            if requested_title_keywords and not any(
+                keyword in person["job_title"].casefold() for keyword in requested_title_keywords
+            ):
+                rejected_title_count += 1
+                continue
             current_ids = {
-                person["company_linkedin_url"].strip().casefold().rstrip("/"),
-                person["company_domain"].strip().casefold().removeprefix("www."),
+                _normalize_company_match_identifier(person["company_linkedin_url"]),
+                _normalize_company_match_identifier(person["company_domain"]),
             }
             current_ids.discard("")
-            if current_ids and current_ids.intersection(approved_ids):
+            if current_ids.intersection(approved_ids):
                 rows.append((raw_row, person))
-            else:
+            elif current_ids:
+                # A positive but conflicting employer identifier is rejected.
                 rejected_count += 1
+            else:
+                # Some Clay people-search records omit employer identifiers.
+                # Keep them because the API request was already scoped to the
+                # approved company identifiers; record this for transparent QA.
+                unverified_employer_count += 1
+                rows.append((raw_row, person))
+            if len(rows) >= 50:
+                break
 
         conn.execute(
             """INSERT INTO clay_people_search_runs
                (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete",
-             f"Filtered out {rejected_count} records without a verifiable current-company match.", created_at),
+             f"Clay returned {len(raw_rows)} raw profiles across pages; excluded {rejected_title_count} outside the requested title keywords and {rejected_count} with a conflicting employer identifier; retained {unverified_employer_count} without employer identifiers under the company-scoped search.", created_at),
         )
 
         for raw_row, person in rows:
@@ -1200,6 +1392,8 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers):
             "count": len(rows),
             "raw_count": len(raw_rows),
             "rejected_count": rejected_count,
+            "rejected_title_count": rejected_title_count,
+            "unverified_employer_count": unverified_employer_count,
             "has_more": has_more,
         }
     except Exception as exc:
@@ -2047,17 +2241,18 @@ if active_page == "Campaigns":
                 ):
                     campaign_for_clay = campaign_as_dict(selected_id) or {}
                     try:
-                        with st.spinner("Searching Clay for companies, then contacts located in the selected country..."):
+                        with st.spinner("Searching Clay for companies, then matching contacts using the campaign title, seniority, department, location and company filters..."):
                             clay_result = run_clay_company_search(campaign_for_clay, selected_id, clay_api_key)
-                            if clay_result["company_domains"]:
+                            if clay_result["company_identifiers"]:
                                 people_result = run_clay_people_search(
                                     campaign_for_clay, selected_id, clay_api_key,
                                     clay_result["company_identifiers"],
+                                    clay_result.get("company_match_identifiers", clay_result["company_identifiers"]),
                                 )
                             else:
                                 people_result = {
                                     "count": 0, "search_id": "", "has_more": False,
-                                    "query": "Contact search skipped because no companies matched."
+                                    "query": "Contact search skipped because no company identifiers were returned."
                                 }
                         log_activity(
                             "Clay company and contact searches completed", selected_id, selected_name, current_mock_user_name,
@@ -2252,6 +2447,8 @@ if active_page == "Campaigns":
                     people_cols[1].metric("More Results Available", "Yes" if latest_people_run["has_more"] else "No")
                     people_cols[2].metric("Contact Search Status", latest_people_run["status"])
                     st.caption(f"Clay People Search ID: {latest_people_run['clay_search_id']} · {latest_people_run['created_at']}")
+                    if latest_people_run["error_message"]:
+                        st.info(latest_people_run["error_message"])
                     st.dataframe(
                         latest_people_results.rename(columns={
                             "full_name": "Contact Name", "first_name": "First Name",
