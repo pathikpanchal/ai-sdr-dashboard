@@ -7,6 +7,9 @@ import re
 import ssl
 import smtplib
 import secrets as pysecrets
+import requests
+import json
+import os
 from email.message import EmailMessage
 from email.utils import formataddr
 from datetime import datetime, timedelta
@@ -108,14 +111,6 @@ JOB_LEVEL_OPTIONS = ["Above", "Any", "Below", "Exact"]
 
 # This ordering is used only to interpret Above / Below in this MVP.
 # Above includes the selected level itself and every level ranked higher.
-SENIORITY_RANK = {
-    "Manager": 1,
-    "Head": 2,
-    "Director": 3,
-    "VP": 4,
-    "C-Suite": 5,
-    "Owner / Founder": 6,
-}
 
 
 def get_connection():
@@ -225,6 +220,44 @@ def get_connection():
         """
     )
 
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clay_search_runs (
+            id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            clay_search_id TEXT,
+            query_text TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            has_more INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            error_message TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clay_company_results (
+            id TEXT PRIMARY KEY,
+            campaign_id TEXT NOT NULL,
+            search_run_id TEXT NOT NULL,
+            clay_company_id TEXT DEFAULT '',
+            company_name TEXT DEFAULT '',
+            domain TEXT DEFAULT '',
+            industry TEXT DEFAULT '',
+            country TEXT DEFAULT '',
+            employee_count TEXT DEFAULT '',
+            company_type TEXT DEFAULT '',
+            location TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            linkedin_url TEXT DEFAULT '',
+            annual_revenue TEXT DEFAULT '',
+            raw_json TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     # Add new columns safely to databases created by the earlier dashboard version.
     migrations = {
         "campaigns": {
@@ -235,6 +268,9 @@ def get_connection():
             "email_sequence_instructions": "TEXT DEFAULT ''",
             "clay_table_url": "TEXT DEFAULT ''",
             "campaign_owner": "TEXT DEFAULT 'Unassigned'",
+            "criteria_approved": "INTEGER DEFAULT 0",
+            "criteria_approved_by": "TEXT DEFAULT ''",
+            "criteria_approved_at": "TEXT DEFAULT ''",
         },
         "leads": {
             "industry": "TEXT DEFAULT ''",
@@ -307,38 +343,6 @@ def get_connection():
 
 
 conn = get_connection()
-
-
-def normalize(value):
-    return " ".join(str(value or "").strip().lower().split())
-
-
-def split_filter_values(query):
-    """Split a multi-value filter on commas or semicolons and normalize each option."""
-    raw = str(query or "").replace(";", ",").replace("\n", ",")
-    return [normalize(part) for part in raw.split(",") if normalize(part)]
-
-
-def text_filter_matches(query, *values):
-    """Match any comma/semicolon-separated option; blank means no restriction."""
-    options = split_filter_values(query)
-    if not options:
-        return True
-
-    def normalize_industry_terms(value):
-        value = normalize(value)
-        # Treat common singular/plural forms as equivalent for industry matching.
-        value = value.replace("pharmaceuticals", "pharmaceutical")
-        value = value.replace("retails", "retail")
-        return value
-
-    options = [normalize_industry_terms(option) for option in options]
-    searchable = [
-        normalize_industry_terms(value)
-        for value in values
-        if normalize_industry_terms(value)
-    ]
-    return any(option in item or item in option for option in options for item in searchable)
 
 
 def normalize_country_name(value):
@@ -426,373 +430,6 @@ def normalize_country_name(value):
         if token in aliases:
             return canonical
     return token
-
-
-def country_filter_matches(query, country):
-    """Match any supplied country name or abbreviation using canonical country names."""
-    options = split_filter_values(query)
-    if not options:
-        return True
-
-    actual_country = normalize_country_name(country)
-    normalized_options = [normalize_country_name(option) for option in options]
-    return actual_country in normalized_options
-
-
-
-def job_title_filter_matches(query, title):
-    """Match job titles, including common executive-title abbreviations."""
-    title_aliases = {
-        "cmo": "chief marketing officer",
-        "ceo": "chief executive officer",
-        "cfo": "chief financial officer",
-        "cto": "chief technology officer",
-        "coo": "chief operating officer",
-        "svp": "senior vice president",
-        "evp": "executive vice president",
-    }
-    options = split_filter_values(query)
-    if not options:
-        return True
-    expanded_options = []
-    for option in options:
-        expanded_options.append(option)
-        if option in title_aliases:
-            expanded_options.append(title_aliases[option])
-    return text_filter_matches(", ".join(expanded_options), title)
-
-
-def classify_seniority(title):
-    title_norm = normalize(title)
-    if any(term in title_norm for term in ["owner", "founder", "co-founder"]):
-        return "Owner / Founder"
-    if any(term in title_norm for term in ["chief", "c-suite", "ceo", "cmo", "cfo", "cto", "coo"]):
-        return "C-Suite"
-    if any(term in title_norm for term in ["vice president", "vp ", "vp,", "svp", "evp"]):
-        return "VP"
-    if "head" in title_norm:
-        return "Head"
-    if "director" in title_norm:
-        return "Director"
-    if "manager" in title_norm:
-        return "Manager"
-    return "Manager"
-
-
-def seniority_matches(selected_seniority, job_level, actual_seniority):
-    if job_level == "Any":
-        return True
-
-    if isinstance(selected_seniority, (list, tuple, set)):
-        selected_levels = list(selected_seniority)
-    else:
-        selected_levels = split_filter_values(selected_seniority)
-
-    selected_ranks = [
-        SENIORITY_RANK[level]
-        for level in selected_levels
-        if level in SENIORITY_RANK
-    ]
-    if not selected_ranks:
-        return True
-
-    actual_rank = SENIORITY_RANK.get(actual_seniority, 1)
-    if job_level == "Above":
-        # With multiple selected levels, use the lowest selected level as the baseline.
-        return actual_rank >= min(selected_ranks)
-    if job_level == "Below":
-        # With multiple selected levels, use the highest selected level as the baseline.
-        return actual_rank <= max(selected_ranks)
-    return actual_rank in selected_ranks  # Exact
-
-
-def synthetic_records():
-    # All records below are fictional. They are used only in Mock Mode.
-    return [
-        {
-            "company": "Northbridge Pharma Group",
-            "website": "https://northbridge.example",
-            "company_type": "Pharmaceutical manufacturer and distributor",
-            "industry": "Pharmaceuticals",
-            "company_country": "United Kingdom",
-            "company_cms": "WordPress",
-            "contact_name": "Amelia Carter",
-            "title": "Head of Marketing",
-            "department": "Marketing",
-            "contact_country": "United Kingdom",
-            "email": "amelia.carter@northbridge.example",
-            "company_score": 94,
-            "contact_score": 92,
-            "reason": "Pharmaceutical business with a senior marketing decision-maker.",
-        },
-        {
-            "company": "Westhaven Pharmaceutical Services",
-            "website": "https://westhaven.example",
-            "company_type": "Pharmaceutical services provider",
-            "industry": "Pharmaceutical Services",
-            "company_country": "United Kingdom",
-            "company_cms": "Drupal",
-            "contact_name": "Oliver Bennett",
-            "title": "Marketing Director",
-            "department": "Marketing",
-            "contact_country": "United Kingdom",
-            "email": "oliver.bennett@westhaven.example",
-            "company_score": 88,
-            "contact_score": 89,
-            "reason": "UK pharmaceutical services business with a marketing director.",
-        },
-        {
-            "company": "Crownwell Pharma Distribution",
-            "website": "https://crownwell.example",
-            "company_type": "Pharmaceutical wholesaler and distributor",
-            "industry": "Pharmaceuticals",
-            "company_country": "United Kingdom",
-            "company_cms": "Sitecore",
-            "contact_name": "Sophie Williams",
-            "title": "Chief Marketing Officer",
-            "department": "Marketing",
-            "contact_country": "United Kingdom",
-            "email": "sophie.williams@crownwell.example",
-            "company_score": 91,
-            "contact_score": 96,
-            "reason": "UK pharmaceutical distributor with an executive marketing owner.",
-        },
-        {
-            "company": "Harborview Pharma Ltd",
-            "website": "https://harborview.example",
-            "company_type": "Pharmaceutical manufacturer",
-            "industry": "Pharmaceuticals",
-            "company_country": "United Kingdom",
-            "company_cms": "WordPress",
-            "contact_name": "Isabella Reed",
-            "title": "Marketing Manager",
-            "department": "Marketing",
-            "contact_country": "United Kingdom",
-            "email": "isabella.reed@harborview.example",
-            "company_score": 90,
-            "contact_score": 84,
-            "reason": "UK pharmaceutical manufacturer with a marketing manager.",
-        },
-        {
-            "company": "Meridian BioHealth",
-            "website": "https://meridianbio.example",
-            "company_type": "Biotechnology research company",
-            "industry": "Biotechnology",
-            "company_country": "United Kingdom",
-            "company_cms": "Webflow",
-            "contact_name": "Noah Hughes",
-            "title": "VP Marketing",
-            "department": "Marketing",
-            "contact_country": "United Kingdom",
-            "email": "noah.hughes@meridianbio.example",
-            "company_score": 62,
-            "contact_score": 88,
-            "reason": "Biotechnology-only profile; separate from the pharmaceutical industry filter.",
-        },
-        {
-            "company": "Ironcrest Industrial Manufacturing",
-            "website": "https://ironcrest.example",
-            "company_type": "Industrial equipment manufacturer",
-            "industry": "Industrial Manufacturing",
-            "company_country": "United Kingdom",
-            "company_cms": "HubSpot",
-            "contact_name": "Ethan Cole",
-            "title": "Head of Marketing",
-            "department": "Marketing",
-            "contact_country": "United Kingdom",
-            "email": "ethan.cole@ironcrest.example",
-            "company_score": 25,
-            "contact_score": 85,
-            "reason": "Generic industrial manufacturer; not a pharmaceutical business.",
-        },
-        {
-            "company": "Brightwell Retail Group",
-            "website": "https://brightwell-retail.example",
-            "company_type": "Multi-channel retail company",
-            "industry": "Retail",
-            "company_country": "United Kingdom",
-            "company_cms": "Shopify",
-            "contact_name": "Grace Morgan",
-            "title": "Marketing Director",
-            "department": "Marketing",
-            "contact_country": "United Kingdom",
-            "email": "grace.morgan@brightwell-retail.example",
-            "company_score": 89,
-            "contact_score": 91,
-            "reason": "UK retail business with a senior marketing decision-maker.",
-        },
-        {
-            "company": "Northstar Consumer Retail",
-            "website": "https://northstar-retail.example",
-            "company_type": "Retail and ecommerce group",
-            "industry": "Retail",
-            "company_country": "United Kingdom",
-            "company_cms": "Magento",
-            "contact_name": "Daniel Foster",
-            "title": "Chief Marketing Officer",
-            "department": "Marketing",
-            "contact_country": "United Kingdom",
-            "email": "daniel.foster@northstar-retail.example",
-            "company_score": 92,
-            "contact_score": 94,
-            "reason": "UK retail and ecommerce group with an executive marketing owner.",
-        },
-        {
-            "company": "Alpine Pharma Europe",
-            "website": "https://alpine.example",
-            "company_type": "Pharmaceutical manufacturer",
-            "industry": "Pharmaceuticals",
-            "company_country": "Germany",
-            "company_cms": "WordPress",
-            "contact_name": "Lucas Meyer",
-            "title": "VP Marketing",
-            "department": "Marketing",
-            "contact_country": "Germany",
-            "email": "lucas.meyer@alpine.example",
-            "company_score": 86,
-            "contact_score": 94,
-            "reason": "Pharmaceutical company, but outside the requested geography.",
-        },
-    ]
-
-
-def run_mock_research(campaign):
-    results = []
-    records = synthetic_records()
-
-    for record in records:
-        if not text_filter_matches(
-            campaign["industry"], record["industry"], record["company_type"]
-        ):
-            continue
-        if not country_filter_matches(campaign["company_country"], record["company_country"]):
-            continue
-        if not country_filter_matches(campaign["contact_country"], record["contact_country"]):
-            continue
-        if not text_filter_matches(campaign["current_cms"], record["company_cms"]):
-            continue
-        if not text_filter_matches(campaign["department"], record["department"]):
-            continue
-        if not job_title_filter_matches(campaign.get("target_titles", ""), record["title"]):
-            continue
-
-        actual_seniority = classify_seniority(record["title"])
-        if not seniority_matches(
-            campaign["seniority"], campaign["job_level"], actual_seniority
-        ):
-            continue
-
-        threshold = int(campaign["min_score"])
-        qualification = (
-            "Qualified"
-            if record["company_score"] >= threshold and record["contact_score"] >= threshold
-            else "Review / Exclude"
-        )
-
-        first_name = record["contact_name"].split()[0]
-        results.append(
-            {
-                "id": str(uuid.uuid4()),
-                "campaign_id": campaign["id"],
-                "company": record["company"],
-                "website": record["website"],
-                "company_type": record["company_type"],
-                "industry": record["industry"],
-                "company_country": record["company_country"],
-                "contact_name": record["contact_name"],
-                "title": record["title"],
-                "contact_country": record["contact_country"],
-                "email": record["email"],
-                "company_score": record["company_score"],
-                "contact_score": record["contact_score"],
-                "qualification": qualification,
-                "reason": record["reason"],
-                "email1_subject": f"A thought for {record['company']}'s marketing team",
-                "email1_body": (
-                    f"Hi {first_name},\n\n"
-                    f"I was looking at {record['company']} and thought it could be worth "
-                    "comparing notes on how pharmaceutical businesses are approaching marketing.\n\n"
-                    "Would you be open to a brief conversation?"
-                ),
-                "email2_subject": f"Re: marketing priorities at {record['company']}",
-                "email2_body": (
-                    f"Hi {first_name},\n\n"
-                    "Following up in case this is relevant. We help teams review their current "
-                    "approach and identify practical opportunities to improve results.\n\n"
-                    "Would a short overview be useful?"
-                ),
-                "email3_subject": "Should I close the loop?",
-                "email3_body": (
-                    f"Hi {first_name},\n\n"
-                    "I appreciate you may have other priorities. Should I close the loop for now, "
-                    "or would a short conversation be worthwhile?"
-                ),
-                "review_status": "Needs review",
-                "company_cms": record["company_cms"],
-                "department": record["department"],
-                "seniority": actual_seniority,
-            }
-        )
-    return results
-
-
-
-def mock_research_diagnostics(campaign):
-    """Return remaining mock-record counts after each campaign filter."""
-    remaining = synthetic_records()
-    diagnostics = [("Available mock records", len(remaining))]
-
-    def apply_filter(label, predicate):
-        nonlocal remaining
-        remaining = [record for record in remaining if predicate(record)]
-        diagnostics.append((label, len(remaining)))
-
-    apply_filter(
-        "Industry",
-        lambda record: text_filter_matches(
-            campaign["industry"], record["industry"], record["company_type"]
-        ),
-    )
-    apply_filter(
-        "Company country",
-        lambda record: country_filter_matches(
-            campaign["company_country"], record["company_country"]
-        ),
-    )
-    apply_filter(
-        "Contact country",
-        lambda record: country_filter_matches(
-            campaign["contact_country"], record["contact_country"]
-        ),
-    )
-    apply_filter(
-        "Current CMS",
-        lambda record: text_filter_matches(
-            campaign["current_cms"], record["company_cms"]
-        ),
-    )
-    apply_filter(
-        "Department",
-        lambda record: text_filter_matches(
-            campaign["department"], record["department"]
-        ),
-    )
-    apply_filter(
-        "Job Titles",
-        lambda record: job_title_filter_matches(
-            campaign.get("target_titles", ""), record["title"]
-        ),
-    )
-    apply_filter(
-        "Seniority / job level",
-        lambda record: seniority_matches(
-            campaign["seniority"],
-            campaign["job_level"],
-            classify_seniority(record["title"]),
-        ),
-    )
-    return diagnostics
-
 
 
 def build_email_sequence_prompt(campaign, lead):
@@ -906,34 +543,203 @@ def on_overview_campaign_checkbox_change(campaign_id, campaign_ids):
     st.session_state["editing_campaign_id"] = None
 
 
-def insert_mock_research_results(campaign_id, records):
-    """Replace a campaign's mock results and update its status."""
-    conn.execute("DELETE FROM leads WHERE campaign_id = ?", (campaign_id,))
-    if records:
-        conn.executemany(
-            """
-            INSERT INTO leads
-            (id, campaign_id, company, website, company_type, industry, company_country,
-             contact_name, title, contact_country, email, company_score, contact_score,
-             qualification, reason, email1_subject, email1_body, email2_subject,
-             email2_body, email3_subject, email3_body, review_status,
-             company_cms, department, seniority)
-            VALUES
-            (:id, :campaign_id, :company, :website, :company_type, :industry, :company_country,
-             :contact_name, :title, :contact_country, :email, :company_score, :contact_score,
-             :qualification, :reason, :email1_subject, :email1_body, :email2_subject,
-             :email2_body, :email3_subject, :email3_body, :review_status,
-             :company_cms, :department, :seniority)
-            """,
-            records,
+def get_clay_api_key():
+    """Read the Clay Public API key from Streamlit Secrets or an environment variable."""
+    secret_value = ""
+    try:
+        clay_secrets = st.secrets.get("clay", {})
+        if hasattr(clay_secrets, "get"):
+            secret_value = clay_secrets.get("api_key", "")
+    except Exception:
+        secret_value = ""
+    return str(secret_value or os.getenv("CLAY_API_KEY", "")).strip()
+
+
+def split_clay_values(query):
+    """Split comma/semicolon/newline values without changing their original casing."""
+    raw = str(query or "").replace(";", ",").replace("\n", ",")
+    values = []
+    seen = set()
+    for part in raw.split(","):
+        value = part.strip()
+        if value and value.casefold() not in seen:
+            values.append(value)
+            seen.add(value.casefold())
+    return values
+
+
+def clay_quote(value):
+    """Safely quote a text value for Clay's advanced search query language."""
+    value = str(value or "").strip().replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{value}"'
+
+
+def build_clay_company_query(campaign):
+    """Build a company-only Clay search from the campaign's company-level filters."""
+    clauses = []
+
+    industries = split_clay_values(campaign.get("industry", ""))
+    if industries:
+        clauses.append("industry in (" + ", ".join(clay_quote(v) for v in industries) + ")")
+
+    countries = split_clay_values(campaign.get("company_country", ""))
+    if countries:
+        canonical_countries = [normalize_country_name(v).title() for v in countries]
+        country_clause = " or ".join(
+            f"country_name = {clay_quote(country)}" for country in canonical_countries
         )
-    new_status = "Draft ready" if records else "No matches"
-    conn.execute(
-        "UPDATE campaigns SET status = ? WHERE id = ?",
-        (new_status, campaign_id),
+        clauses.append(f"locations.any({country_clause})")
+
+    cms_values = split_clay_values(campaign.get("current_cms", ""))
+    if cms_values:
+        cms_clause = " or ".join(
+            f"vendor = {clay_quote(cms)}" for cms in cms_values
+        )
+        clauses.append(f"technographics.any({cms_clause})")
+
+    if not clauses:
+        raise ValueError(
+            "Add at least one company-level filter (Industry, Company Country, or Current CMS) before searching Clay."
+        )
+
+    return "select from companies where " + " and ".join(clauses)
+
+
+def run_clay_company_search(campaign, campaign_id, api_key):
+    """Create a Clay company search and fetch its first page (up to 50 results)."""
+    query_text = build_clay_company_query(campaign)
+    headers = {
+        "clay-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+    base_url = "https://api.clay.com/public/v0"
+    created_at = datetime.now().isoformat(timespec="seconds")
+    run_id = str(uuid.uuid4())
+    clay_search_id = ""
+
+    try:
+        create_response = requests.post(
+            f"{base_url}/search/query-mode",
+            headers=headers,
+            json={"query": query_text},
+            timeout=30,
+        )
+        if not create_response.ok:
+            try:
+                detail = create_response.json().get("message", create_response.text)
+            except Exception:
+                detail = create_response.text
+            raise RuntimeError(f"Clay search creation failed (HTTP {create_response.status_code}): {detail}")
+
+        create_payload = create_response.json()
+        clay_search_id = create_payload.get("search_id", "")
+        if not clay_search_id:
+            raise RuntimeError("Clay created the request but did not return a search ID.")
+
+        results_response = requests.post(
+            f"{base_url}/search/query-mode/{clay_search_id}/run",
+            headers=headers,
+            json={"limit": 50},
+            timeout=45,
+        )
+        if not results_response.ok:
+            try:
+                detail = results_response.json().get("message", results_response.text)
+            except Exception:
+                detail = results_response.text
+            raise RuntimeError(f"Clay results request failed (HTTP {results_response.status_code}): {detail}")
+
+        results_payload = results_response.json()
+        rows = results_payload.get("data", []) or []
+        has_more = bool(results_payload.get("has_more", False))
+
+        conn.execute(
+            """INSERT INTO clay_search_runs
+               (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete", "", created_at),
+        )
+
+        for row in rows:
+            location_value = row.get("location") or {}
+            if isinstance(location_value, dict):
+                location_text = location_value.get("name", "")
+                country_value = location_value.get("country") or location_value.get("country_name") or ""
+            else:
+                location_text = str(location_value or "")
+                country_value = row.get("country", "")
+            country_value = row.get("country") or country_value
+            conn.execute(
+                """INSERT INTO clay_company_results
+                   (id, campaign_id, search_run_id, clay_company_id, company_name, domain, industry,
+                    country, employee_count, company_type, location, description, linkedin_url,
+                    annual_revenue, raw_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()), campaign_id, run_id,
+                    str(row.get("clay_company_id", "") or ""),
+                    str(row.get("name", "") or ""),
+                    str(row.get("domain", "") or ""),
+                    str(row.get("industry", "") or ""),
+                    str(country_value or ""),
+                    str(row.get("size", row.get("estimated_employee_count", "")) or ""),
+                    str(row.get("type", "") or ""),
+                    str(location_text or ""),
+                    str(row.get("description", "") or ""),
+                    str(row.get("linkedin_url", "") or ""),
+                    str(row.get("annual_revenue", "") or ""),
+                    json.dumps(row, ensure_ascii=False),
+                    created_at,
+                ),
+            )
+
+        conn.execute(
+            "UPDATE campaigns SET status = ? WHERE id = ?",
+            ("Company Search Complete" if rows else "No Companies Found", campaign_id),
+        )
+        conn.commit()
+        return {
+            "run_id": run_id,
+            "search_id": clay_search_id,
+            "query": query_text,
+            "count": len(rows),
+            "has_more": has_more,
+        }
+    except Exception as exc:
+        existing_run = conn.execute("SELECT 1 FROM clay_search_runs WHERE id = ?", (run_id,)).fetchone()
+        if existing_run:
+            conn.execute(
+                "UPDATE clay_search_runs SET status = ?, error_message = ? WHERE id = ?",
+                ("Failed", str(exc)[:1000], run_id),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO clay_search_runs
+                   (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
+                   VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)""",
+                (run_id, campaign_id, clay_search_id, query_text, "Failed", str(exc)[:1000], created_at),
+            )
+        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Clay Search Failed", campaign_id))
+        conn.commit()
+        raise
+
+
+def load_latest_clay_company_search(campaign_id):
+    run = conn.execute(
+        "SELECT * FROM clay_search_runs WHERE campaign_id = ? ORDER BY created_at DESC LIMIT 1",
+        (campaign_id,),
+    ).fetchone()
+    if not run:
+        return None, pd.DataFrame()
+    columns = [item[1] for item in conn.execute("PRAGMA table_info(clay_search_runs)").fetchall()]
+    run_dict = dict(zip(columns, run))
+    results = pd.read_sql_query(
+        "SELECT company_name, domain, industry, country, employee_count, company_type, location, linkedin_url, annual_revenue "
+        "FROM clay_company_results WHERE search_run_id = ? ORDER BY company_name",
+        conn,
+        params=(run_dict["id"],),
     )
-    conn.commit()
-    return new_status
+    return run_dict, results
 
 
 def format_created_date(value):
@@ -1008,27 +814,6 @@ if previous_mock_identity != current_mock_user_email:
 campaign_edit_notice = st.session_state.pop("campaign_edit_notice", None)
 if campaign_edit_notice and active_page in ("Campaigns", "Review & Approvals"):
     st.success(campaign_edit_notice)
-
-last_research_notice = st.session_state.pop("last_research_notice", None)
-if last_research_notice and active_page == "Campaigns":
-    if last_research_notice["found"]:
-        st.success(
-            f"Mock research complete: {last_research_notice['count']} matching contacts found; "
-            f"{last_research_notice['qualified_count']} passed the ICP score threshold."
-        )
-    else:
-        st.warning(
-            "No sample records matched all selected filters. No Clay search was performed."
-        )
-        with st.expander("Why were no records found? — filter diagnostics", expanded=True):
-            st.caption("Counts show how many fictional sample records remain after each filter.")
-            for filter_name, remaining_count in last_research_notice["diagnostics"]:
-                st.write(f"**{filter_name}:** {remaining_count}")
-            st.caption(
-                "The minimum ICP score labels records as Qualified or Review / Exclude; "
-                "it does not remove them from the results."
-            )
-
 
 def campaign_as_dict(campaign_id):
     row = conn.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
@@ -1447,10 +1232,55 @@ if active_page == "Campaigns":
             selected_owner = str(selected_row.get("campaign_owner", "Unassigned") or "Unassigned")
 
             st.divider()
-            action_title, edit_col, duplicate_col, delete_col = st.columns([3.4, 1.3, 1.55, 1.3])
+            action_title, approve_col, build_col, edit_col, duplicate_col, delete_col = st.columns([2.25, 1.35, 1.55, 1.2, 1.45, 1.1])
             with action_title:
                 st.markdown(f"#### Selected Campaign: {selected_name}")
             selected_permission = get_campaign_permission(selected_id)
+            selected_approved = bool(int(selected_row.get("criteria_approved", 0) or 0))
+            clay_api_key = get_clay_api_key()
+            with approve_col:
+                if selected_permission in ("Owner", "Can Edit"):
+                    if selected_approved:
+                        st.button("Criteria Approved", key="selected_criteria_approved", disabled=True, use_container_width=True)
+                    elif st.button("Approve Criteria", key="approve_campaign_criteria", type="primary", use_container_width=True):
+                        approved_at = datetime.now().isoformat(timespec="seconds")
+                        conn.execute(
+                            "UPDATE campaigns SET criteria_approved = 1, criteria_approved_by = ?, criteria_approved_at = ?, status = ? WHERE id = ?",
+                            (current_mock_user_name, approved_at, "Criteria Approved", selected_id),
+                        )
+                        conn.commit()
+                        log_activity("Campaign criteria approved", selected_id, selected_name, current_mock_user_name,
+                                     "Campaign criteria approved before starting Clay company search.")
+                        st.rerun()
+                else:
+                    st.caption("View Only")
+            with build_col:
+                if st.button(
+                    "Build Campaign Data",
+                    key="build_campaign_data_clay",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=(not selected_approved or not clay_api_key or selected_permission not in ("Owner", "Can Edit")),
+                ):
+                    campaign_for_clay = campaign_as_dict(selected_id) or {}
+                    try:
+                        with st.spinner("Searching Clay for matching companies..."):
+                            clay_result = run_clay_company_search(campaign_for_clay, selected_id, clay_api_key)
+                        log_activity(
+                            "Clay company search completed", selected_id, selected_name, current_mock_user_name,
+                            f"Retrieved {clay_result['count']} company records. Clay search ID: {clay_result['search_id']}",
+                        )
+                        st.session_state["clay_search_notice"] = {
+                            "success": True,
+                            "count": clay_result["count"],
+                            "has_more": clay_result["has_more"],
+                            "search_id": clay_result["search_id"],
+                        }
+                        st.rerun()
+                    except Exception as exc:
+                        log_activity("Clay company search failed", selected_id, selected_name, current_mock_user_name, str(exc)[:500])
+                        st.session_state["clay_search_notice"] = {"success": False, "error": str(exc)}
+                        st.rerun()
             with edit_col:
                 if selected_permission in ("Owner", "Can Edit"):
                     if st.button("Edit Campaign", key="selected_edit_campaign", use_container_width=True):
@@ -1471,6 +1301,24 @@ if active_page == "Campaigns":
                         st.session_state["pending_campaign_action"] = "delete"
                         st.session_state["pending_campaign_action_id"] = selected_id
                         st.rerun()
+
+            if not selected_approved:
+                st.info("Review the campaign filters, then select **Approve Criteria** to unlock the Clay search.")
+            elif not clay_api_key:
+                st.warning("Clay API key is not configured. Add it in Streamlit Cloud → App settings → Secrets to enable Build Campaign Data.")
+            st.caption(
+                "Build Campaign Data runs a real Clay company search (up to 50 results per run). "
+                "Contact filters such as job titles, department, seniority, and contact country are reserved for the next contact-search step."
+            )
+
+            clay_notice = st.session_state.pop("clay_search_notice", None)
+            if clay_notice:
+                if clay_notice.get("success"):
+                    st.success(f"Clay company search completed: {clay_notice['count']} companies returned.")
+                    if clay_notice.get("has_more"):
+                        st.info("Clay has more matching companies available. This test run retrieved the first 50 results only.")
+                else:
+                    st.error(f"Clay search failed: {clay_notice.get('error', 'Unknown error')}")
 
             detail_cols = st.columns([1.25, 2.75])
             with detail_cols[0]:
@@ -1504,6 +1352,35 @@ if active_page == "Campaigns":
                             or "No custom instructions added."
                         )
 
+            latest_clay_run, latest_clay_results = load_latest_clay_company_search(selected_id)
+            if latest_clay_run:
+                st.markdown("#### Clay Company Search Results")
+                if latest_clay_run["status"] == "Complete":
+                    run_meta_cols = st.columns(3)
+                    run_meta_cols[0].metric("Companies Returned", int(latest_clay_run["result_count"]))
+                    run_meta_cols[1].metric("More Results Available", "Yes" if latest_clay_run["has_more"] else "No")
+                    run_meta_cols[2].metric("Search Status", latest_clay_run["status"])
+                    st.caption(f"Clay Search ID: {latest_clay_run['clay_search_id']} · {latest_clay_run['created_at']}")
+                    st.dataframe(
+                        latest_clay_results.rename(columns={
+                            "company_name": "Company Name", "domain": "Domain", "industry": "Industry",
+                            "country": "Country", "employee_count": "Employee Count", "company_type": "Company Type",
+                            "location": "Location", "linkedin_url": "LinkedIn URL", "annual_revenue": "Annual Revenue",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Domain": st.column_config.LinkColumn("Domain", display_text="Open domain"),
+                            "LinkedIn URL": st.column_config.LinkColumn("LinkedIn URL", display_text="Company LinkedIn"),
+                        },
+                    )
+                    with st.expander("Clay search query sent"):
+                        st.code(latest_clay_run["query_text"], language="sql")
+                else:
+                    st.error(f"Latest Clay search failed: {latest_clay_run['error_message']}")
+                    with st.expander("Clay search query sent"):
+                        st.code(latest_clay_run["query_text"], language="sql")
+
             # A confirmation is always required before any selected-campaign action.
             pending_action = st.session_state.get("pending_campaign_action")
             pending_action_id = st.session_state.get("pending_campaign_action_id")
@@ -1519,7 +1396,7 @@ if active_page == "Campaigns":
                     ),
                     "delete": (
                         f"Are you sure you want to delete the '{selected_name}' campaign? "
-                        "Its associated local mock results will also be deleted. This cannot be undone."
+                        "Its locally stored Clay search results will also be deleted. This cannot be undone."
                     ),
                 }
                 with st.container(border=True):
@@ -1591,16 +1468,18 @@ if active_page == "Campaigns":
                                     selected_id,
                                     selected_name,
                                     selected_owner,
-                                    "Campaign and associated local mock results deleted.",
+                                    "Campaign and its locally stored Clay search results deleted.",
                                 )
                                 conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
+                                conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (selected_id,))
+                                conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (selected_id,))
                                 conn.execute("DELETE FROM campaigns WHERE id = ?", (selected_id,))
                                 conn.commit()
                                 remaining_ids = [item for item in campaign_ids if item != selected_id]
                                 st.session_state.pop("pending_campaign_action", None)
                                 st.session_state.pop("pending_campaign_action_id", None)
                                 st.session_state.pop("editing_campaign_id", None)
-                                st.session_state["campaign_delete_notice"] = "Campaign and its local mock results have been deleted."
+                                st.session_state["campaign_delete_notice"] = "Campaign and its locally stored search results have been deleted."
                                 st.session_state.pop("overview_campaign", None)
                                 st.session_state.pop("_force_campaign_selection", None)
                                 st.session_state["_reset_campaign_preview_widget"] = True
@@ -1693,12 +1572,11 @@ if active_page == "Campaigns":
                         "Clay Table Link (optional)",
                         value=str(selected_row.get("clay_table_url", "") or ""),
                         placeholder="Paste the Clay table URL here when available",
-                        help="This saves a link only. Clay is not connected in Mock Mode.",
+                        help="Optional reference link to a Clay table created separately. The Public Search API does not create tables.",
                     )
-                    save_changes = st.form_submit_button("Save Changes")
-                    save_and_rerun = st.form_submit_button("Save Changes & Re-run Search", type="primary")
+                    save_changes = st.form_submit_button("Save Changes", type="primary")
 
-                if save_changes or save_and_rerun:
+                if save_changes:
                     if not edit_name.strip():
                         st.error("Please enter a campaign name.")
                     elif not edit_seniority and edit_job_level != "Any":
@@ -1711,7 +1589,8 @@ if active_page == "Campaigns":
                             SET name = ?, campaign_owner = ?, industry = ?, company_country = ?,
                                 contact_country = ?, target_titles = ?, min_score = ?, current_cms = ?,
                                 department = ?, seniority = ?, job_level = ?,
-                                email_sequence_instructions = ?, clay_table_url = ?, status = ?
+                                email_sequence_instructions = ?, clay_table_url = ?, status = ?,
+                                criteria_approved = 0, criteria_approved_by = '', criteria_approved_at = ''
                             WHERE id = ?
                             """,
                             (
@@ -1724,59 +1603,18 @@ if active_page == "Campaigns":
                             ),
                         )
 
-                        if save_and_rerun:
-                            campaign_for_run = dict(selected_row)
-                            campaign_for_run.update(
-                                {
-                                    "name": edit_name.strip(),
-                                    "campaign_owner": owner_value,
-                                    "industry": edit_industry.strip(),
-                                    "company_country": edit_company_country.strip(),
-                                    "contact_country": edit_contact_country.strip(),
-                                    "target_titles": edit_target_titles.strip(),
-                                    "current_cms": edit_current_cms.strip(),
-                                    "department": edit_department.strip(),
-                                    "seniority": ", ".join(edit_seniority),
-                                    "job_level": edit_job_level,
-                                    "min_score": int(edit_min_score),
-                                    "email_sequence_instructions": edit_email_instructions.strip(),
-                                    "clay_table_url": edit_clay_table_url.strip(),
-                                }
-                            )
-                            records = run_mock_research(campaign_for_run)
-                            new_status = insert_mock_research_results(selected_id, records)
-                            st.session_state["last_research_notice"] = {
-                                "found": bool(records),
-                                "count": len(records),
-                                "qualified_count": sum(
-                                    record["qualification"] == "Qualified" for record in records
-                                ),
-                                "diagnostics": mock_research_diagnostics(campaign_for_run) if not records else [],
-                            }
-                            log_activity(
-                                "Campaign edited and mock search re-run",
-                                selected_id,
-                                edit_name.strip(),
-                                owner_value,
-                                f"Updated criteria. New status: {new_status}.",
-                            )
-                            st.session_state["campaign_edit_notice"] = (
-                                f"Campaign updated and mock search re-run. Status: {new_status}."
-                            )
-                        else:
-                            conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
-                            conn.commit()
-                            log_activity(
-                                "Campaign edited",
-                                selected_id,
-                                edit_name.strip(),
-                                owner_value,
-                                "Campaign criteria updated; previous mock results cleared.",
-                            )
-                            st.session_state["campaign_edit_notice"] = (
-                                "Campaign updated. Previous mock results were cleared. "
-                                "Use 'Save Changes & Re-run Search' to run the updated criteria."
-                            )
+                        # Criteria edits invalidate the previous approval and old search results.
+                        conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (selected_id,))
+                        conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (selected_id,))
+                        conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
+                        conn.commit()
+                        log_activity(
+                            "Campaign criteria updated", selected_id, edit_name.strip(), owner_value,
+                            "Criteria changed. Previous approval and Clay search results were cleared; approve the updated criteria before searching again.",
+                        )
+                        st.session_state["campaign_edit_notice"] = (
+                            "Campaign updated. Please approve the revised criteria before running a new Clay search."
+                        )
 
                         st.session_state["active_campaign_id"] = selected_id
                         st.session_state["run_campaign_selector"] = selected_id
@@ -1790,60 +1628,14 @@ if active_page == "Campaigns":
                     st.session_state.pop("campaign_edit_context", None)
                     st.rerun()
 
-    # Keep the mock research runner available without a separate navigation tab.
-    campaigns_for_run = load_campaigns()
-    if not campaigns_for_run.empty:
-        campaigns_for_run = campaigns_for_run[
-            campaigns_for_run["id"].apply(
-                lambda campaign_id: get_campaign_permission(campaign_id) in ("Owner", "Can Edit")
-            )
-        ]
-    if not campaigns_for_run.empty:
-        with st.expander("Run Mock Research", expanded=False):
-            st.caption(
-                "This runs against fictional sample records only. It does not connect to Clay "
-                "or consume Clay credits."
-            )
-            run_ids = campaigns_for_run["id"].tolist()
-            if st.session_state.get("run_campaign_selector") not in run_ids:
-                st.session_state["run_campaign_selector"] = run_ids[0]
-            active_default = st.session_state.get("active_campaign_id")
-            default_index = run_ids.index(active_default) if active_default in run_ids else 0
-            run_campaign_id = st.selectbox(
-                "Select campaign to research",
-                run_ids,
-                index=default_index,
-                format_func=lambda item: campaign_label(item, campaigns_for_run),
-                key="run_campaign_selector",
-            )
-            if st.button("Start Simulated Research", type="primary", key="start_mock_research"):
-                campaign = campaign_as_dict(run_campaign_id)
-                records = run_mock_research(campaign)
-                new_status = insert_mock_research_results(run_campaign_id, records)
-                qualified_count = sum(record["qualification"] == "Qualified" for record in records)
-                st.session_state["last_research_notice"] = {
-                    "found": bool(records),
-                    "count": len(records),
-                    "qualified_count": qualified_count,
-                    "diagnostics": mock_research_diagnostics(campaign) if not records else [],
-                }
-                log_activity(
-                    "Mock research completed",
-                    run_campaign_id,
-                    campaign.get("name", ""),
-                    campaign.get("campaign_owner", "Unassigned"),
-                    f"{len(records)} sample contacts found; status: {new_status}.",
-                )
-                st.session_state["lead_campaign_selector"] = run_campaign_id
-                st.rerun()
 
 elif active_page == "Review & Approvals":
     st.subheader("Review & Approvals")
-    st.caption("Review the sample contacts and email drafts associated with each campaign.")
+    st.caption("Review contact records and email drafts associated with each campaign.")
     campaigns = load_campaigns()
     if campaigns.empty:
         if is_mock_admin:
-            st.info("Create a campaign and run Mock Research first.")
+            st.info("Create a campaign, approve its criteria, and run Build Campaign Data first.")
         else:
             st.info("No campaigns have been shared with this mock user.")
     else:
@@ -1865,7 +1657,7 @@ elif active_page == "Review & Approvals":
             params=(selected_campaign_id,),
         )
         if leads.empty:
-            st.info("No sample contacts yet. Run Mock Research from the Campaigns page.")
+            st.info("No contact records yet. Company search is the first integration step; contact search will be added next.")
         else:
             metric1, metric2, metric3 = st.columns(3)
             metric1.metric("Matching Contacts", len(leads))
@@ -1927,7 +1719,7 @@ elif active_page == "Review & Approvals":
                 )
             with st.expander("Email-generation prompt preview"):
                 st.caption(
-                    "This is a preview only. Mock Mode does not send a request to Clay or an AI model."
+                    "This is a prompt preview only. No enrichment or email sending is triggered here."
                 )
                 st.code(build_email_sequence_prompt(selected_campaign, row.to_dict()), language="text")
 
@@ -1985,9 +1777,8 @@ elif active_page == "Review & Approvals":
                 )
                 st.success("Contact marked as approved. No email has been sent.")
 
-            st.warning(
-                "This MVP uses fictional sample data. It does not connect to Clay, "
-                "enrich real records, or send emails."
+            st.info(
+                "Clay company search is connected separately. Contact search, enrichment, and email sending are not part of this first integration test."
             )
 
 elif active_page == "Team & Access":
@@ -2263,15 +2054,21 @@ elif active_page == "Settings":
     st.subheader("Settings")
     st.caption("Dashboard mode and integration status")
     settings_cols = st.columns(3)
-    settings_cols[0].metric("Execution Mode", "Mock Mode")
-    settings_cols[1].metric("Clay Connection", "Not Connected")
+    settings_cols[0].metric("Execution Mode", "Clay API Test" if get_clay_api_key() else "Test Mode")
+    settings_cols[1].metric("Clay API Key", "Configured" if get_clay_api_key() else "Not Configured")
     settings_cols[2].metric(
         "Invitation Email",
         "Configured" if invitation_email_is_configured() else "Not Configured",
     )
-    st.markdown("#### Current setup")
-    st.write("- The dashboard uses fictional sample company and contact records.")
-    st.write("- No Clay API requests are made and no Clay credits are consumed.")
-    st.write("- Clay table URLs can be saved and opened, but the dashboard does not read or update Clay tables.")
+    st.markdown("#### Connect Clay")
+    st.write("The Build Campaign Data action uses Clay's Public Search API to search company records and return the first 50 matches to this dashboard.")
+    st.write("To connect it, create a Clay API key in your Clay workspace under API and CLI → API keys, then add it to Streamlit Cloud → App settings → Secrets:")
+    st.code('[clay]\napi_key = "PASTE_YOUR_CLAY_API_KEY_HERE"', language="toml")
+    st.caption("Keep the key in Streamlit Secrets. Do not paste it into the dashboard, GitHub source code, or this chat.")
+    st.markdown("#### Integration scope")
+    st.write("- Build Campaign Data performs a real Clay company search; it does not generate fictional company records.")
+    st.write("- Industry, company country, and current CMS are used for company search. Job titles, department, seniority, and contact country are reserved for the contact-search step.")
+    st.write("- The search API returns records to this dashboard. It does not create or write a Clay workbook/table.")
+    st.write("- This first test does not enrich contacts, consume enrichment credits, create email drafts from live data, or launch campaigns.")
+    st.write("- Search results and campaign data are stored in the app's SQLite database.")
     st.write("- Email drafts are not sent. Team invitations can be emailed when SMTP is configured in Streamlit Secrets.")
-    st.write("- Campaign data is stored in the app's SQLite database.")
