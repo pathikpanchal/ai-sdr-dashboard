@@ -265,6 +265,22 @@ def get_connection():
         )
         """
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS clay_people_search_runs ("
+        "id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, clay_search_id TEXT DEFAULT '', "
+        "query_text TEXT NOT NULL, result_count INTEGER NOT NULL DEFAULT 0, "
+        "has_more INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, "
+        "error_message TEXT DEFAULT '', created_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS clay_people_results ("
+        "id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL, search_run_id TEXT NOT NULL, "
+        "clay_profile_id TEXT DEFAULT '', full_name TEXT DEFAULT '', first_name TEXT DEFAULT '', "
+        "last_name TEXT DEFAULT '', job_title TEXT DEFAULT '', seniority TEXT DEFAULT '', "
+        "department TEXT DEFAULT '', location TEXT DEFAULT '', location_country TEXT DEFAULT '', "
+        "company_name TEXT DEFAULT '', company_domain TEXT DEFAULT '', company_linkedin_url TEXT DEFAULT '', "
+        "linkedin_url TEXT DEFAULT '', raw_json TEXT DEFAULT '', created_at TEXT NOT NULL)"
+    )
 
 
     connection.execute(
@@ -321,6 +337,16 @@ def get_connection():
             "company_cms": "TEXT DEFAULT ''",
             "department": "TEXT DEFAULT ''",
             "seniority": "TEXT DEFAULT ''",
+        },
+        "clay_company_results": {
+            "company_linkedin_url": "TEXT DEFAULT ''",
+        },
+        "clay_people_results": {
+            "first_name": "TEXT DEFAULT ''",
+            "last_name": "TEXT DEFAULT ''",
+            "seniority": "TEXT DEFAULT ''",
+            "department": "TEXT DEFAULT ''",
+            "company_linkedin_url": "TEXT DEFAULT ''",
         },
     }
     for table_name, columns in migrations.items():
@@ -841,6 +867,11 @@ def run_clay_company_search(campaign, campaign_id, api_key):
                     created_at,
                 ),
             )
+            conn.execute(
+                "UPDATE clay_company_results SET company_linkedin_url = ? WHERE id = ?",
+                (str(row.get("linkedin_url", row.get("company_linkedin_url", row.get("social_url", ""))) or ""),
+                 conn.execute("SELECT id FROM clay_company_results WHERE search_run_id = ? ORDER BY rowid DESC LIMIT 1", (run_id,)).fetchone()[0]),
+            )
 
         conn.execute(
             "UPDATE campaigns SET status = ? WHERE id = ?",
@@ -856,6 +887,12 @@ def run_clay_company_search(campaign, campaign_id, api_key):
             "company_domains": list(dict.fromkeys(
                 str(row.get("domain", "")).strip().lower()
                 for row in rows if str(row.get("domain", "")).strip()
+            )),
+            "company_identifiers": list(dict.fromkeys(
+                str(value).strip()
+                for row in rows
+                for value in [row.get("linkedin_url") or row.get("company_linkedin_url") or row.get("social_url") or row.get("domain")]
+                if str(value or "").strip()
             )),
         }
     except Exception as exc:
@@ -877,33 +914,207 @@ def run_clay_company_search(campaign, campaign_id, api_key):
         raise
 
 
-def build_clay_people_query(campaign, company_domains):
-    """Search for people located in the requested country at the companies just found."""
-    if not company_domains:
-        raise ValueError("Clay returned no company domains, so contact search cannot be scoped to those companies.")
 
-    clauses = []
+def fetch_clay_people_filter_schema(api_key):
+    """Read Clay's live people-search fields before sending controlled filters."""
+    response = requests.get(
+        "https://api.clay.com/public/v0/search/filters-mode/fields",
+        headers={"clay-api-key": api_key},
+        params={"source_type": "people"},
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"Could not read Clay people-search filter schema (HTTP {response.status_code}): "
+            f"{response.text[:700]}"
+        )
+    payload = response.json()
+    fields = payload.get("fields", [])
+    return {field.get("name"): field for field in fields if field.get("name")}
+
+
+def _clay_filter_values(schema_field, values, label):
+    """Return only values accepted by a controlled Clay field; preserve free text."""
+    values = [str(value).strip() for value in values if str(value).strip()]
+    allowed = schema_field.get("allowed_values") or schema_field.get("allowedValues") or []
+    if not allowed:
+        return values
+    allowed_lookup = {str(value).casefold(): str(value) for value in allowed}
+    mapped = [allowed_lookup[value.casefold()] for value in values if value.casefold() in allowed_lookup]
+    if values and not mapped:
+        raise ValueError(
+            f"Your {label} value ({', '.join(values)}) does not match Clay's current options. "
+            f"Supported examples: {', '.join(str(v) for v in allowed[:12])}"
+        )
+    return mapped
+
+
+def build_clay_people_filters(campaign, company_identifiers, people_schema):
+    """Build people filters using the exact target-company identifiers from this run."""
+    if not company_identifiers:
+        raise ValueError("No company LinkedIn URLs or domains were returned, so contact search cannot be safely scoped.")
+
+    filters = {}
+
+    # Clay's Search API supports a company_identifier filter for people search.
+    # Use LinkedIn company URLs first, falling back to domains only if unavailable.
+    if "company_identifier" not in people_schema:
+        raise RuntimeError(
+            "Clay's live people-search schema does not expose company_identifier. "
+            "The dashboard stopped rather than running an unscoped contact search."
+        )
+    filters["company_identifier"] = company_identifiers
+
     contact_countries = [
         normalize_country_name(value).title()
         for value in split_clay_values(campaign.get("contact_country", ""))
     ]
     if contact_countries:
-        country_clause = " or ".join(
-            f"location_country = {clay_quote(country)}" for country in contact_countries
+        field = people_schema.get("location_countries_include")
+        if not field:
+            raise RuntimeError("Clay's current people-search schema does not expose location_countries_include.")
+        filters["location_countries_include"] = _clay_filter_values(
+            field, contact_countries, "Contact Country"
         )
-        clauses.append(f"({country_clause})")
 
-    domain_clause = ", ".join(clay_quote(domain) for domain in company_domains)
-    clauses.append(
-        "experiences.any(is_current = true and company.domain in (" + domain_clause + "))"
+    title_values = split_clay_values(campaign.get("target_titles", ""))
+    if title_values and not any(v.casefold() == "any" for v in title_values):
+        field = people_schema.get("job_title_keywords")
+        if not field:
+            raise RuntimeError("Clay's current people-search schema does not expose job_title_keywords.")
+        filters["job_title_keywords"] = _clay_filter_values(field, title_values, "Job Titles")
+
+    seniority_value = str(campaign.get("seniority", "") or "").strip()
+    if seniority_value and seniority_value.casefold() not in ("any", "all"):
+        field = people_schema.get("job_title_seniority_levels_v2")
+        if not field:
+            raise RuntimeError("Clay's current people-search schema does not expose job_title_seniority_levels_v2.")
+        seniority_aliases = {
+            "c-suite": ["c-suite"],
+            "c suite": ["c-suite"],
+            "executive": ["c-suite"],
+            "vp": ["vp"],
+            "vice president": ["vp"],
+            "director": ["director"],
+            "head": ["head"],
+            "manager": ["manager"],
+        }
+        requested = seniority_aliases.get(seniority_value.casefold(), [seniority_value])
+        filters["job_title_seniority_levels_v2"] = _clay_filter_values(
+            field, requested, "Seniority"
+        )
+
+    department_value = str(campaign.get("department", "") or "").strip()
+    if department_value and department_value.casefold() not in ("any", "all"):
+        field = people_schema.get("job_functions")
+        if field:
+            filters["job_functions"] = _clay_filter_values(
+                field, [department_value], "Department"
+            )
+        else:
+            raise RuntimeError(
+                "Clay's current people-search schema does not expose job_functions, "
+                "so the requested Department filter cannot be safely applied."
+            )
+
+    return filters
+
+
+def _first_nonempty(mapping, *keys):
+    if not isinstance(mapping, dict):
+        return ""
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return ""
+
+
+def _extract_current_experience(row):
+    experiences = _first_nonempty(row, "experiences", "experience", "employment_history", "employmentHistory")
+    if not experiences:
+        current_exp = _first_nonempty(row, "current_experience", "currentExperience")
+        if isinstance(current_exp, dict):
+            experiences = [current_exp]
+    if isinstance(experiences, dict):
+        experiences = [experiences]
+    if not isinstance(experiences, list):
+        return {}
+    current = next(
+        (item for item in experiences if isinstance(item, dict) and (
+            item.get("is_current") is True or item.get("isCurrent") is True or item.get("current") is True
+        )),
+        None,
     )
+    return current or (experiences[0] if experiences and isinstance(experiences[0], dict) else {})
 
-    return "select from people where " + " and ".join(clauses)
+
+def _parse_clay_person_row(row):
+    """Normalize Clay's returned profile fields across snake_case/camelCase shapes."""
+    experience = _extract_current_experience(row)
+    company = _first_nonempty(experience, "company", "organization", "current_company", "currentCompany")
+    if not isinstance(company, dict):
+        company = {}
+    location = _first_nonempty(row, "location", "person_location", "personLocation")
+    if isinstance(location, dict):
+        location_text = _first_nonempty(location, "name", "display_name", "displayName", "formatted")
+        location_country = _first_nonempty(location, "country", "country_name", "countryName")
+    else:
+        location_text = str(location or "")
+        location_country = _first_nonempty(row, "location_country", "locationCountry", "country")
+    if not location_country and location_text:
+        location_lower = location_text.casefold()
+        country_candidates = [
+            "United States", "United Kingdom", "Canada", "Australia",
+            "India", "Germany", "France", "Japan", "Singapore",
+        ]
+        location_country = next(
+            (country for country in country_candidates if country.casefold() in location_lower),
+            "",
+        )
+
+    full_name = _first_nonempty(row, "full_name", "fullName", "name", "display_name", "displayName")
+    first_name = _first_nonempty(row, "first_name", "firstName")
+    last_name = _first_nonempty(row, "last_name", "lastName")
+    if full_name and not first_name:
+        parts = str(full_name).strip().split()
+        first_name = parts[0] if parts else ""
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    seniority = _first_nonempty(row, "seniorities", "seniority", "job_title_seniority", "jobTitleSeniority")
+    if isinstance(seniority, list):
+        seniority = ", ".join(str(value) for value in seniority)
+
+    department = _first_nonempty(row, "job_functions", "jobFunctions", "department", "function")
+    if isinstance(department, list):
+        department = ", ".join(str(value) for value in department)
+
+    return {
+        "clay_profile_id": str(_first_nonempty(row, "clay_profile_id", "clayProfileId", "id", "profile_id", "profileId") or ""),
+        "full_name": str(full_name or ""),
+        "first_name": str(first_name or ""),
+        "last_name": str(last_name or ""),
+        "job_title": str(_first_nonempty(row, "job_title", "jobTitle", "title", "headline") or _first_nonempty(experience, "title", "job_title", "jobTitle") or ""),
+        "seniority": str(seniority or ""),
+        "department": str(department or ""),
+        "location": str(location_text or ""),
+        "location_country": str(location_country or ""),
+        "company_name": str(_first_nonempty(row, "company_name", "companyName") or _first_nonempty(company, "name", "company_name", "companyName") or ""),
+        "company_domain": str(_first_nonempty(row, "company_domain", "companyDomain") or _first_nonempty(company, "domain", "website", "company_domain") or ""),
+        "company_linkedin_url": str(_first_nonempty(row, "company_linkedin_url", "companyLinkedinUrl", "current_company_linkedin_url", "currentCompanyLinkedinUrl", "company_social_url") or _first_nonempty(company, "linkedin_url", "linkedinUrl", "social_url", "url", "profile_url") or ""),
+        "linkedin_url": str(_first_nonempty(row, "linkedin_url", "linkedinUrl", "profile_url", "profileUrl", "linkedInUrl") or ""),
+    }
 
 
-def run_clay_people_search(campaign, campaign_id, api_key, company_domains):
-    """Run a separate people search, restricted to the current company-search domains."""
-    query_text = build_clay_people_query(campaign, company_domains)
+def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers):
+    """Search people at the exact companies from the preceding company-search run."""
+    people_schema = fetch_clay_people_filter_schema(api_key)
+    filters = build_clay_people_filters(campaign, company_identifiers, people_schema)
+    query_text = json.dumps(
+        {"source_type": "people", "filters": filters},
+        ensure_ascii=False,
+        indent=2,
+    )
     headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
     base_url = "https://api.clay.com/public/v0"
     created_at = datetime.now().isoformat(timespec="seconds")
@@ -912,9 +1123,9 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_domains):
 
     try:
         create_response = requests.post(
-            f"{base_url}/search/query-mode",
+            f"{base_url}/search/filters-mode",
             headers=headers,
-            json={"query": query_text},
+            json={"source_type": "people", "filters": filters},
             timeout=30,
         )
         if not create_response.ok:
@@ -927,7 +1138,7 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_domains):
             raise RuntimeError("Clay did not return a contact search ID.")
 
         results_response = requests.post(
-            f"{base_url}/search/query-mode/{clay_search_id}/run",
+            f"{base_url}/search/filters-mode/{clay_search_id}/run",
             headers=headers,
             json={"limit": 50},
             timeout=45,
@@ -937,50 +1148,48 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_domains):
                 f"Clay contact results request failed (HTTP {results_response.status_code}): "
                 f"{results_response.text[:1000]}"
             )
-
         payload = results_response.json()
-        rows = payload.get("data", []) or []
+        raw_rows = payload.get("data", []) or []
         has_more = bool(payload.get("has_more", False))
+
+        # Defense in depth: only accept profiles whose returned current employer
+        # matches a company identifier from this campaign's preceding company search.
+        approved_ids = {str(value).strip().casefold().rstrip("/") for value in company_identifiers}
+        rows = []
+        rejected_count = 0
+        for raw_row in raw_rows:
+            person = _parse_clay_person_row(raw_row)
+            current_ids = {
+                person["company_linkedin_url"].strip().casefold().rstrip("/"),
+                person["company_domain"].strip().casefold().removeprefix("www."),
+            }
+            current_ids.discard("")
+            if current_ids and current_ids.intersection(approved_ids):
+                rows.append((raw_row, person))
+            else:
+                rejected_count += 1
 
         conn.execute(
             """INSERT INTO clay_people_search_runs
                (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete", "", created_at),
+            (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete",
+             f"Filtered out {rejected_count} records without a verifiable current-company match.", created_at),
         )
-        for row in rows:
-            location = row.get("location") or {}
-            if isinstance(location, dict):
-                location_text = location.get("name", "")
-                location_country = location.get("country") or location.get("country_name") or ""
-            else:
-                location_text = str(location or "")
-                location_country = row.get("location_country", row.get("country", ""))
-            current_experiences = row.get("experiences") or row.get("experience") or []
-            current_company = {}
-            if isinstance(current_experiences, list):
-                current_company = next(
-                    (exp.get("company", {}) for exp in current_experiences
-                     if isinstance(exp, dict) and exp.get("is_current")),
-                    {},
-                ) or {}
+
+        for raw_row, person in rows:
             conn.execute(
                 """INSERT INTO clay_people_results
-                   (id, campaign_id, search_run_id, clay_profile_id, full_name, job_title,
-                    location, location_country, company_name, company_domain, linkedin_url, raw_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (id, campaign_id, search_run_id, clay_profile_id, full_name, first_name, last_name,
+                    job_title, seniority, department, location, location_country, company_name,
+                    company_domain, company_linkedin_url, linkedin_url, raw_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    str(uuid.uuid4()), campaign_id, run_id,
-                    str(row.get("clay_profile_id", row.get("id", "")) or ""),
-                    str(row.get("name", row.get("full_name", "")) or ""),
-                    str(row.get("job_title", row.get("title", "")) or ""),
-                    str(location_text or ""),
-                    str(location_country or ""),
-                    str(row.get("company_name", current_company.get("name", "")) or ""),
-                    str(row.get("company_domain", current_company.get("domain", "")) or ""),
-                    str(row.get("linkedin_url", row.get("profile_url", "")) or ""),
-                    json.dumps(row, ensure_ascii=False),
-                    created_at,
+                    str(uuid.uuid4()), campaign_id, run_id, person["clay_profile_id"],
+                    person["full_name"], person["first_name"], person["last_name"], person["job_title"],
+                    person["seniority"], person["department"], person["location"], person["location_country"],
+                    person["company_name"], person["company_domain"], person["company_linkedin_url"],
+                    person["linkedin_url"], json.dumps(raw_row, ensure_ascii=False), created_at,
                 ),
             )
         conn.commit()
@@ -989,6 +1198,8 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_domains):
             "search_id": clay_search_id,
             "query": query_text,
             "count": len(rows),
+            "raw_count": len(raw_rows),
+            "rejected_count": rejected_count,
             "has_more": has_more,
         }
     except Exception as exc:
@@ -1000,7 +1211,6 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_domains):
         )
         conn.commit()
         raise
-
 
 
 def load_latest_clay_people_search(campaign_id):
@@ -1016,7 +1226,8 @@ def load_latest_clay_people_search(campaign_id):
         run,
     ))
     results = pd.read_sql_query(
-        "SELECT full_name, job_title, location, location_country, company_name, company_domain, linkedin_url "
+        "SELECT full_name, first_name, last_name, job_title, seniority, department, location, "
+        "location_country, company_name, company_domain, company_linkedin_url, linkedin_url "
         "FROM clay_people_results WHERE search_run_id = ? ORDER BY full_name",
         conn,
         params=(run_dict["id"],),
@@ -1621,7 +1832,7 @@ if active_page == "Campaigns":
                             if clay_result["company_domains"]:
                                 people_result = run_clay_people_search(
                                     campaign_for_clay, selected_id, clay_api_key,
-                                    clay_result["company_domains"],
+                                    clay_result["company_identifiers"],
                                 )
                             else:
                                 people_result = {
@@ -1725,8 +1936,12 @@ if active_page == "Campaigns":
                     run_meta_cols[1].metric("More Results Available", "Yes" if latest_clay_run["has_more"] else "No")
                     run_meta_cols[2].metric("Search Status", latest_clay_run["status"])
                     st.caption(f"Clay Search ID: {latest_clay_run['clay_search_id']} · {latest_clay_run['created_at']}")
+                    company_results_display = latest_clay_results.copy()
+                    company_results_display["domain"] = company_results_display["domain"].fillna("").astype(str).str.strip().apply(
+                        lambda value: value if not value or value.startswith(("http://", "https://")) else "https://" + value
+                    )
                     st.dataframe(
-                        latest_clay_results.rename(columns={
+                        company_results_display.rename(columns={
                             "company_name": "Company Name", "domain": "Domain", "industry": "Industry",
                             "country": "Country", "employee_count": "Employee Count", "company_type": "Company Type",
                             "location": "Location", "linkedin_url": "LinkedIn URL", "annual_revenue": "Annual Revenue",
@@ -1734,7 +1949,7 @@ if active_page == "Campaigns":
                         use_container_width=True,
                         hide_index=True,
                         column_config={
-                            "Domain": st.column_config.LinkColumn("Domain", display_text="Open domain"),
+                            "Domain": st.column_config.LinkColumn("Domain", display_text=r"https?://([^/]+)"),
                             "LinkedIn URL": st.column_config.LinkColumn("LinkedIn URL", display_text="Company LinkedIn"),
                         },
                     )
@@ -1758,15 +1973,19 @@ if active_page == "Campaigns":
                     st.caption(f"Clay People Search ID: {latest_people_run['clay_search_id']} · {latest_people_run['created_at']}")
                     st.dataframe(
                         latest_people_results.rename(columns={
-                            "full_name": "Contact Name", "job_title": "Job Title",
+                            "full_name": "Contact Name", "first_name": "First Name",
+                            "last_name": "Last Name", "job_title": "Job Title",
+                            "seniority": "Seniority", "department": "Department",
                             "location": "Person Location", "location_country": "Person Country",
                             "company_name": "Current Company", "company_domain": "Company Domain",
+                            "company_linkedin_url": "Company LinkedIn URL",
                             "linkedin_url": "LinkedIn URL",
                         }),
                         use_container_width=True,
                         hide_index=True,
                         column_config={
                             "LinkedIn URL": st.column_config.LinkColumn("LinkedIn URL", display_text="LinkedIn Profile"),
+                            "Company LinkedIn URL": st.column_config.LinkColumn("Company LinkedIn URL", display_text="Company LinkedIn"),
                         },
                     )
                     with st.expander("Clay contact search query sent"):
