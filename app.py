@@ -1315,6 +1315,8 @@ if previous_mock_identity != current_mock_user_email:
         "pending_campaign_action",
         "pending_campaign_action_id",
         "editing_campaign_id",
+        "campaign_action_confirmed",
+        "campaign_action_confirmed_id",
     ):
         st.session_state.pop(state_key, None)
     st.session_state.pop("overview_campaign", None)
@@ -1332,6 +1334,50 @@ def campaign_as_dict(campaign_id):
         return None
     columns = [item[1] for item in conn.execute("PRAGMA table_info(campaigns)").fetchall()]
     return dict(zip(columns, row))
+
+
+@st.dialog("Confirm Campaign Action", width="small")
+def show_campaign_action_dialog(action, campaign_id, campaign_name):
+    prompts = {
+        "edit": (
+            f"Open the criteria editor for **{campaign_name}**? "
+            "You can review and save changes before they take effect."
+        ),
+        "duplicate": (
+            f"Create a separate copy of **{campaign_name}**? "
+            "The original campaign will remain unchanged."
+        ),
+        "delete": (
+            f"Delete **{campaign_name}**? Its locally stored company and contact search results "
+            "will also be deleted. This action cannot be undone."
+        ),
+    }
+    confirm_labels = {
+        "edit": "Continue to Edit",
+        "duplicate": "Duplicate Campaign",
+        "delete": "Delete Campaign",
+    }
+    st.write(prompts.get(action, "Confirm this campaign action."))
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button(
+            confirm_labels.get(action, "Confirm"),
+            type="primary",
+            use_container_width=True,
+            key=f"confirm_dialog_{action}_{campaign_id}",
+        ):
+            st.session_state["campaign_action_confirmed"] = True
+            st.session_state["campaign_action_confirmed_id"] = campaign_id
+            st.rerun()
+    with cancel_col:
+        if st.button(
+            "Cancel",
+            use_container_width=True,
+            key=f"cancel_dialog_{action}_{campaign_id}",
+        ):
+            st.session_state.pop("pending_campaign_action", None)
+            st.session_state.pop("pending_campaign_action_id", None)
+            st.rerun()
 
 
 def log_activity(action, campaign_id=None, campaign_name="", actor="Unassigned", details=""):
@@ -1994,114 +2040,99 @@ if active_page == "Campaigns":
                     st.error(f"Latest Clay contact search failed: {latest_people_run['error_message']}")
                     with st.expander("Clay contact search query sent"):
                         st.code(latest_people_run["query_text"], language="sql")
-            # A confirmation is always required before any selected-campaign action.
+            # Native popup confirmation keeps all three actions in the first fold.
             pending_action = st.session_state.get("pending_campaign_action")
             pending_action_id = st.session_state.get("pending_campaign_action_id")
             if pending_action and pending_action_id == selected_id:
-                action_prompts = {
-                    "edit": (
-                        f"Are you sure you want to edit the '{selected_name}' campaign? "
-                        "The campaign criteria editor will open."
-                    ),
-                    "duplicate": (
-                        f"Are you sure you want to duplicate the '{selected_name}' campaign? "
-                        "A separate copy will be created and opened in the editor; the original will remain unchanged."
-                    ),
-                    "delete": (
-                        f"Are you sure you want to delete the '{selected_name}' campaign? "
-                        "Its locally stored Clay search results will also be deleted. This cannot be undone."
-                    ),
-                }
-                with st.container(border=True):
-                    st.warning(action_prompts[pending_action])
-                    yes_col, cancel_col = st.columns(2)
-                    with yes_col:
-                        confirm_label = {
-                            "edit": "Yes, Edit Campaign",
-                            "duplicate": "Yes, Duplicate Campaign",
-                            "delete": "Yes, Delete Campaign",
-                        }[pending_action]
-                        if st.button(confirm_label, type="primary", key="confirm_selected_campaign_action"):
-                            if pending_action == "edit":
-                                st.session_state["editing_campaign_id"] = selected_id
-                                log_activity("Edit opened", selected_id, selected_name, selected_owner)
-                                st.session_state.pop("pending_campaign_action", None)
-                                st.session_state.pop("pending_campaign_action_id", None)
-                                st.rerun()
-                            elif pending_action == "duplicate":
-                                new_id = str(uuid.uuid4())
-                                new_name = selected_name + " (Copy)"
-                                duplicate_owner = selected_owner if is_mock_admin else current_mock_user_name
-                                conn.execute(
-                                    """
-                                    INSERT INTO campaigns
-                                    (id, name, industry, company_country, contact_country, target_titles,
-                                     min_score, status, created_at, current_cms, department, seniority,
-                                     job_level, email_sequence_instructions, clay_table_url, campaign_owner)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (
-                                        new_id,
-                                        new_name,
-                                        selected_row["industry"] or "",
-                                        selected_row["company_country"] or "",
-                                        selected_row["contact_country"] or "",
-                                        selected_row["target_titles"] or "",
-                                        int(selected_row["min_score"]),
-                                        "Draft",
-                                        datetime.now().isoformat(timespec="seconds"),
-                                        selected_row.get("current_cms", "") or "",
-                                        selected_row.get("department", "") or "",
-                                        selected_row.get("seniority", "Manager") or "Manager",
-                                        selected_row.get("job_level", "Above") or "Above",
-                                        selected_row.get("email_sequence_instructions", "") or "",
-                                        "",  # A duplicate starts without the original Clay table URL.
-                                        duplicate_owner,
-                                    ),
-                                )
-                                conn.commit()
-                                log_activity(
-                                    "Campaign duplicated",
-                                    new_id,
-                                    new_name,
-                                    duplicate_owner,
-                                    f"Duplicated from campaign: {selected_name}",
-                                )
-                                st.session_state["overview_campaign"] = new_id
-                                st.session_state["_force_campaign_selection"] = new_id
-                                st.session_state["_reset_campaign_preview_widget"] = True
-                                st.session_state["editing_campaign_id"] = new_id
-                                st.session_state["campaign_edit_context"] = "duplicate"
-                                st.session_state.pop("pending_campaign_action", None)
-                                st.session_state.pop("pending_campaign_action_id", None)
-                                st.rerun()
-                            elif pending_action == "delete":
-                                log_activity(
-                                    "Campaign deleted",
-                                    selected_id,
-                                    selected_name,
-                                    selected_owner,
-                                    "Campaign and its locally stored Clay search results deleted.",
-                                )
-                                conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
-                                conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (selected_id,))
-                                conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (selected_id,))
-                                conn.execute("DELETE FROM campaigns WHERE id = ?", (selected_id,))
-                                conn.commit()
-                                remaining_ids = [item for item in campaign_ids if item != selected_id]
-                                st.session_state.pop("pending_campaign_action", None)
-                                st.session_state.pop("pending_campaign_action_id", None)
-                                st.session_state.pop("editing_campaign_id", None)
-                                st.session_state["campaign_delete_notice"] = "Campaign and its locally stored search results have been deleted."
-                                st.session_state.pop("overview_campaign", None)
-                                st.session_state.pop("_force_campaign_selection", None)
-                                st.session_state["_reset_campaign_preview_widget"] = True
-                                st.rerun()
-                    with cancel_col:
-                        if st.button("Cancel", key="cancel_selected_campaign_action"):
-                            st.session_state.pop("pending_campaign_action", None)
-                            st.session_state.pop("pending_campaign_action_id", None)
-                            st.rerun()
+                show_campaign_action_dialog(
+                    pending_action,
+                    selected_id,
+                    selected_name,
+                )
+
+            if (
+                st.session_state.get("campaign_action_confirmed")
+                and st.session_state.get("campaign_action_confirmed_id") == selected_id
+                and pending_action_id == selected_id
+            ):
+                if pending_action == "edit":
+                    st.session_state["editing_campaign_id"] = selected_id
+                    log_activity("Edit opened", selected_id, selected_name, selected_owner)
+                    st.session_state.pop("pending_campaign_action", None)
+                    st.session_state.pop("pending_campaign_action_id", None)
+                    st.rerun()
+                elif pending_action == "duplicate":
+                    new_id = str(uuid.uuid4())
+                    new_name = selected_name + " (Copy)"
+                    duplicate_owner = selected_owner if is_mock_admin else current_mock_user_name
+                    conn.execute(
+                        """
+                        INSERT INTO campaigns
+                        (id, name, industry, company_country, contact_country, target_titles,
+                         min_score, status, created_at, current_cms, department, seniority,
+                         job_level, email_sequence_instructions, clay_table_url, campaign_owner)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_id,
+                            new_name,
+                            selected_row["industry"] or "",
+                            selected_row["company_country"] or "",
+                            selected_row["contact_country"] or "",
+                            selected_row["target_titles"] or "",
+                            int(selected_row["min_score"]),
+                            "Draft",
+                            datetime.now().isoformat(timespec="seconds"),
+                            selected_row.get("current_cms", "") or "",
+                            selected_row.get("department", "") or "",
+                            selected_row.get("seniority", "Manager") or "Manager",
+                            selected_row.get("job_level", "Above") or "Above",
+                            selected_row.get("email_sequence_instructions", "") or "",
+                            "",  # A duplicate starts without the original Clay table URL.
+                            duplicate_owner,
+                        ),
+                    )
+                    conn.commit()
+                    log_activity(
+                        "Campaign duplicated",
+                        new_id,
+                        new_name,
+                        duplicate_owner,
+                        f"Duplicated from campaign: {selected_name}",
+                    )
+                    st.session_state["overview_campaign"] = new_id
+                    st.session_state["_force_campaign_selection"] = new_id
+                    st.session_state["_reset_campaign_preview_widget"] = True
+                    st.session_state["editing_campaign_id"] = new_id
+                    st.session_state["campaign_edit_context"] = "duplicate"
+                    st.session_state.pop("pending_campaign_action", None)
+                    st.session_state.pop("pending_campaign_action_id", None)
+                    st.rerun()
+                elif pending_action == "delete":
+                    log_activity(
+                        "Campaign deleted",
+                        selected_id,
+                        selected_name,
+                        selected_owner,
+                        "Campaign and its locally stored Clay search results deleted.",
+                    )
+                    conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
+                    conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (selected_id,))
+                    conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (selected_id,))
+                    conn.execute("DELETE FROM campaigns WHERE id = ?", (selected_id,))
+                    conn.commit()
+                    remaining_ids = [item for item in campaign_ids if item != selected_id]
+                    st.session_state.pop("pending_campaign_action", None)
+                    st.session_state.pop("pending_campaign_action_id", None)
+                    st.session_state.pop("editing_campaign_id", None)
+                    st.session_state["campaign_delete_notice"] = "Campaign and its locally stored search results have been deleted."
+                    st.session_state.pop("overview_campaign", None)
+                    st.session_state.pop("_force_campaign_selection", None)
+                    st.session_state["_reset_campaign_preview_widget"] = True
+                    st.rerun()
+
+                st.session_state.pop("campaign_action_confirmed", None)
+                st.session_state.pop("campaign_action_confirmed_id", None)
 
             # The same criteria editor is used for normal edits and newly duplicated campaigns.
             if st.session_state.get("editing_campaign_id") == selected_id and selected_permission in ("Owner", "Can Edit"):
