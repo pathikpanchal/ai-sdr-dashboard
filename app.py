@@ -10,6 +10,8 @@ import secrets as pysecrets
 import requests
 import json
 import os
+import hashlib
+import time
 from email.message import EmailMessage
 from email.utils import formataddr
 from datetime import datetime, timedelta
@@ -329,6 +331,10 @@ def get_connection():
             "job_level": "TEXT DEFAULT 'Above'",
             "email_sequence_instructions": "TEXT DEFAULT ''",
             "clay_table_url": "TEXT DEFAULT ''",
+            "clay_companies_webhook_url": "TEXT DEFAULT ''",
+            "clay_contacts_webhook_url": "TEXT DEFAULT ''",
+            "clay_companies_webhook_auth": "TEXT DEFAULT ''",
+            "clay_contacts_webhook_auth": "TEXT DEFAULT ''",
             "campaign_owner": "TEXT DEFAULT 'Unassigned'",
             "criteria_approved": "INTEGER DEFAULT 0",
             "criteria_approved_by": "TEXT DEFAULT ''",
@@ -653,7 +659,8 @@ def clay_quote(value):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_clay_company_industry_options(api_key):
     """Fetch Clay's live controlled industry values from its company filter schema."""
-    response = requests.get(
+    response = _clay_api_request(
+        "GET",
         "https://api.clay.com/public/v0/search/filters-mode/fields",
         headers={"clay-api-key": api_key},
         params={"source_type": "companies"},
@@ -672,7 +679,7 @@ def fetch_clay_company_industry_options(api_key):
     )
     if not industry_field:
         raise RuntimeError("Clay's company-search schema did not return an industry field.")
-    options = industry_field.get("allowedValues") or industry_field.get("allowed_values") or []
+    options = _field_allowed_values(industry_field)
     options = [str(value).strip() for value in options if str(value).strip()]
     if not options:
         raise RuntimeError("Clay returned no allowed industry values.")
@@ -684,15 +691,13 @@ def normalize_industry_text(value):
 
 
 def map_industry_to_clay(user_input, allowed_values):
-    """Map common sales language to a live Clay category; never invent a category."""
+    """Map one or more industry labels to Clay's live controlled vocabulary."""
     from difflib import get_close_matches
 
-    raw = str(user_input or "").strip()
-    if not raw:
+    raw_values = split_clay_values(user_input)
+    if not raw_values:
         return [], "No industry filter entered."
 
-    # Explicit aliases are intentionally conservative. Add aliases only where the
-    # business meaning is sufficiently clear; otherwise ask the salesperson.
     aliases = {
         "finance": ["Financial Services"],
         "financial services": ["Financial Services"],
@@ -710,35 +715,37 @@ def map_industry_to_clay(user_input, allowed_values):
         "it services": ["IT Services and IT Consulting"],
         "information technology": ["IT Services and IT Consulting"],
     }
-
     normalized_options = {normalize_industry_text(option): option for option in allowed_values}
-    normalized_input = normalize_industry_text(raw)
-
-    # Exact category match takes priority.
-    if normalized_input in normalized_options:
-        return [normalized_options[normalized_input]], "Exact Clay category match"
-
-    # Apply only aliases whose target exists in Clay's current live option list.
-    alias_targets = aliases.get(normalized_input, [])
-    matched_aliases = [
-        normalized_options[normalize_industry_text(target)]
-        for target in alias_targets
-        if normalize_industry_text(target) in normalized_options
-    ]
-    if matched_aliases:
-        return matched_aliases, "Automatic synonym mapping"
-
-    # For other entries, suggest a close category only when it is a strong text match.
-    close = get_close_matches(
-        normalized_input,
-        list(normalized_options.keys()),
-        n=1,
-        cutoff=0.88,
-    )
-    if close:
-        return [normalized_options[close[0]]], "Close category match — please review"
-
-    return [], "No safe automatic match. Please choose a Clay industry category."
+    mapped, statuses, unmatched = [], [], []
+    for raw in raw_values:
+        normalized = normalize_industry_text(raw)
+        if normalized in normalized_options:
+            mapped.append(normalized_options[normalized])
+            statuses.append("Exact Clay category match")
+            continue
+        alias_hits = [
+            normalized_options[normalize_industry_text(target)]
+            for target in aliases.get(normalized, [])
+            if normalize_industry_text(target) in normalized_options
+        ]
+        if alias_hits:
+            mapped.extend(alias_hits)
+            statuses.append("Automatic synonym mapping")
+            continue
+        close = get_close_matches(normalized, list(normalized_options.keys()), n=1, cutoff=0.88)
+        if close:
+            mapped.append(normalized_options[close[0]])
+            statuses.append(f"Close category match for '{raw}' — please review")
+        else:
+            unmatched.append(raw)
+    if unmatched:
+        return [], "No safe Clay category match for: " + ", ".join(unmatched)
+    mapped = list(dict.fromkeys(mapped))
+    if any(status.startswith("Close category") for status in statuses):
+        return mapped, "Close category match — " + "; ".join(statuses)
+    if len(set(statuses)) == 1:
+        return mapped, statuses[0]
+    return mapped, "; ".join(dict.fromkeys(statuses))
 
 
 def build_clay_company_query(campaign):
@@ -759,13 +766,6 @@ def build_clay_company_query(campaign):
         )
         clauses.append(f"locations.any({country_clause})")
 
-    cms_values = split_clay_values(campaign.get("current_cms", ""))
-    if cms_values:
-        cms_clause = " or ".join(
-            f"vendor = {clay_quote(cms)}" for cms in cms_values
-        )
-        clauses.append(f"technographics.any({cms_clause})")
-
     if not clauses:
         raise ValueError(
             "Add at least one company-level filter (Industry, Company Country, or Current CMS) before searching Clay."
@@ -774,21 +774,167 @@ def build_clay_company_query(campaign):
     return "select from companies where " + " and ".join(clauses)
 
 
+def _clay_api_request(method, url, headers, json_body=None, params=None, timeout=40, attempts=3):
+    """Call Clay with bounded retries for transient network, rate-limit and server errors."""
+    retry_statuses = {408, 425, 429, 500, 502, 503, 504}
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=json_body,
+                params=params,
+                timeout=timeout,
+            )
+            if response.status_code not in retry_statuses or attempt == attempts - 1:
+                return response
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                wait_seconds = min(8.0, max(1.0, float(retry_after))) if retry_after else min(8.0, 2 ** attempt)
+            except (TypeError, ValueError):
+                wait_seconds = min(8.0, 2 ** attempt)
+            time.sleep(wait_seconds)
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == attempts - 1:
+                raise RuntimeError(f"Clay request failed after {attempts} attempts: {exc}") from exc
+            time.sleep(min(8.0, 2 ** attempt))
+    if last_error:
+        raise RuntimeError(f"Clay request failed: {last_error}") from last_error
+    raise RuntimeError("Clay request failed without a response.")
+
+
+def _clay_json(response, label):
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Clay {label} returned an invalid JSON response (HTTP {response.status_code}).") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Clay {label} returned an unexpected response format.")
+    return payload
+
+
+def _stable_company_key(row):
+    return str(
+        row.get("clay_company_id") or row.get("id") or row.get("domain")
+        or row.get("linkedin_url") or row.get("company_linkedin_url") or row.get("name") or ""
+    ).strip().casefold()
+
+
+def _stable_person_key(row):
+    person = _parse_clay_person_row(row)
+    return str(
+        person.get("clay_profile_id") or person.get("linkedin_url")
+        or "|".join([
+            person.get("full_name", "").casefold(),
+            person.get("company_domain", "").casefold(),
+            person.get("job_title", "").casefold(),
+        ])
+    ).strip()
+
+
+def collect_clay_search_results(api_key, search_id, entity_type, max_results=200, page_size=20):
+    """Collect search pages, deduplicating each result by its stable Clay identity."""
+    base_url = "https://api.clay.com/public/v0"
+    headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
+    rows, seen = [], set()
+    has_more = False
+    page_count = 0
+
+    while len(rows) < max_results:
+        page_limit = min(page_size, max_results - len(rows))
+        response = _clay_api_request(
+            "POST",
+            f"{base_url}/search/filters-mode/{search_id}/run",
+            headers=headers,
+            json_body={"limit": page_limit},
+            timeout=60,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"Clay {entity_type} results request failed (HTTP {response.status_code}): {response.text[:1000]}"
+            )
+        payload = _clay_json(response, f"{entity_type} results")
+        page_rows = payload.get("data", [])
+        if not isinstance(page_rows, list):
+            raise RuntimeError(f"Clay {entity_type} results response did not contain a data list.")
+        page_count += 1
+        has_more = bool(payload.get("has_more", False))
+        new_rows = []
+        for row in page_rows:
+            if not isinstance(row, dict):
+                continue
+            stable_key = _stable_company_key(row) if entity_type == "company" else _stable_person_key(row)
+            if not stable_key:
+                # Keep unidentified rows once; Clay should normally return an ID/domain/profile URL.
+                stable_key = hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            if stable_key in seen:
+                continue
+            seen.add(stable_key)
+            new_rows.append(row)
+        rows.extend(new_rows)
+
+        # Stop safely if Clay repeats a page. This avoids an accidental infinite loop.
+        if not page_rows or not new_rows or not has_more:
+            break
+
+    if len(rows) >= max_results and has_more:
+        has_more = True
+    return rows[:max_results], has_more, page_count
+
+
+def fetch_clay_company_filter_schema(api_key):
+    response = _clay_api_request(
+        "GET",
+        "https://api.clay.com/public/v0/search/filters-mode/fields",
+        headers={"clay-api-key": api_key},
+        params={"source_type": "companies"},
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"Could not read Clay company-search filter schema (HTTP {response.status_code}): {response.text[:700]}"
+        )
+    payload = _clay_json(response, "company filter schema")
+    fields = payload.get("fields", [])
+    schema = {field.get("name"): field for field in fields if isinstance(field, dict) and field.get("name")}
+    if not schema:
+        raise RuntimeError("Clay returned an empty company-search filter schema.")
+    return schema
+
+
 def run_clay_company_search(campaign, campaign_id, api_key):
-    """Run a Clay company search using the explicit headquarters-only country filter."""
-    mapped_industry = str(campaign.get("industry_clay_value", "") or "").strip()
-    industry_values = [mapped_industry] if mapped_industry else split_clay_values(campaign.get("industry", ""))
-    country_values = [normalize_country_name(v).title() for v in split_clay_values(campaign.get("company_country", ""))]
-
+    """Search companies in Clay, persist results locally, and return normalized records."""
+    campaign = campaign_as_dict(campaign_id) or campaign
+    schema = fetch_clay_company_filter_schema(api_key)
     filters = {}
-    if industry_values:
-        filters["industries"] = industry_values
-    if country_values:
-        filters["country_names"] = country_values
-        filters["location_headquarters_only"] = True
 
+    mapped_industry = str(campaign.get("industry_clay_value", "") or "").strip()
+    industry_values = split_clay_values(mapped_industry) if mapped_industry else split_clay_values(campaign.get("industry", ""))
+    if industry_values:
+        industry_field = schema.get("industries") or schema.get("industry")
+        if not industry_field:
+            raise RuntimeError("Clay's live company-search schema does not expose an industries filter.")
+        filters["industries"] = _clay_filter_values(industry_field, industry_values, "Industry")
+
+    country_values = [normalize_country_name(value).title() for value in split_clay_values(campaign.get("company_country", ""))]
+    if country_values:
+        if "country_names" not in schema:
+            raise RuntimeError("Clay's live company-search schema does not expose country_names.")
+        filters["country_names"] = country_values
+        if "location_headquarters_only" in schema:
+            filters["location_headquarters_only"] = True
+
+    # Current CMS is intentionally not used as a search filter in this phase.
+    # The sales team will add Clay's website-technology/CMS enrichment after reviewing the sourced list.
+    validation_note = (
+        "Current CMS is reserved for manual enrichment in the Clay workbook after review."
+        if split_clay_values(campaign.get("current_cms", "")) else ""
+    )
     if not filters:
-        raise ValueError("Add at least one company-level filter before searching Clay.")
+        raise ValueError("Add at least one company-search filter (Industry or Company Country). Current CMS is enriched later in Clay.")
 
     headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
     base_url = "https://api.clay.com/public/v0"
@@ -796,43 +942,27 @@ def run_clay_company_search(campaign, campaign_id, api_key):
     run_id = str(uuid.uuid4())
     clay_search_id = ""
     query_text = json.dumps(
-        {"source_type": "companies", "filters": filters},
+        {"source_type": "companies", "filters": filters, "note": validation_note},
         ensure_ascii=False,
         indent=2,
     )
-
     try:
-        create_response = requests.post(
-            f"{base_url}/search/filters-mode",
-            headers=headers,
-            json={"source_type": "companies", "filters": filters},
-            timeout=30,
+        create_response = _clay_api_request(
+            "POST", f"{base_url}/search/filters-mode", headers=headers,
+            json_body={"source_type": "companies", "filters": filters}, timeout=40,
         )
         if not create_response.ok:
-            detail = create_response.text[:1000]
             raise RuntimeError(
-                f"Clay company search creation failed (HTTP {create_response.status_code}): {detail}"
+                f"Clay company search creation failed (HTTP {create_response.status_code}): {create_response.text[:1000]}"
             )
-        clay_search_id = create_response.json().get("search_id", "")
+        create_payload = _clay_json(create_response, "company search creation")
+        clay_search_id = str(create_payload.get("search_id", "") or "")
         if not clay_search_id:
             raise RuntimeError("Clay did not return a company search ID.")
 
-        results_response = requests.post(
-            f"{base_url}/search/filters-mode/{clay_search_id}/run",
-            headers=headers,
-            json={"limit": 50},
-            timeout=45,
+        rows, has_more, page_count = collect_clay_search_results(
+            api_key, clay_search_id, "company", max_results=200, page_size=20
         )
-        if not results_response.ok:
-            raise RuntimeError(
-                f"Clay company results request failed (HTTP {results_response.status_code}): "
-                f"{results_response.text[:1000]}"
-            )
-
-        payload = results_response.json()
-        rows = payload.get("data", []) or []
-        has_more = bool(payload.get("has_more", False))
-
         conn.execute(
             """INSERT INTO clay_search_runs
                (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
@@ -840,88 +970,86 @@ def run_clay_company_search(campaign, campaign_id, api_key):
             (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete", "", created_at),
         )
 
+        export_records = []
+        company_linkedin_urls, company_domains = [], []
         for row in rows:
             location_value = row.get("location") or {}
             if isinstance(location_value, dict):
-                location_text = location_value.get("name", "")
+                location_text = location_value.get("name") or location_value.get("display_name") or ""
                 country_value = location_value.get("country") or location_value.get("country_name") or ""
             else:
                 location_text = str(location_value or "")
                 country_value = row.get("country", "")
             country_value = row.get("country") or country_value
+            company_id_value = str(row.get("clay_company_id", row.get("id", "")) or "")
+            company_name = str(row.get("name", row.get("company_name", "")) or "")
+            domain = str(row.get("domain", row.get("website", "")) or "").strip()
+            linkedin_url = str(
+                row.get("linkedin_url") or row.get("company_linkedin_url")
+                or row.get("linkedin_url_company") or row.get("social_url") or ""
+            ).strip()
+            result_id = str(uuid.uuid4())
             conn.execute(
                 """INSERT INTO clay_company_results
                    (id, campaign_id, search_run_id, clay_company_id, company_name, domain, industry,
                     country, employee_count, company_type, location, description, linkedin_url,
-                    annual_revenue, raw_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    annual_revenue, raw_json, created_at, company_linkedin_url)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    str(uuid.uuid4()), campaign_id, run_id,
-                    str(row.get("clay_company_id", row.get("id", "")) or ""),
-                    str(row.get("name", "") or ""),
-                    str(row.get("domain", "") or ""),
-                    str(row.get("industry", "") or ""),
-                    str(country_value or ""),
-                    str(row.get("size", row.get("estimated_employee_count", "")) or ""),
-                    str(row.get("type", "") or ""),
-                    str(location_text or ""),
-                    str(row.get("description", "") or ""),
-                    str(row.get("linkedin_url", row.get("linkedin_url_company", "")) or ""),
-                    str(row.get("annual_revenue", "") or ""),
-                    json.dumps(row, ensure_ascii=False),
-                    created_at,
+                    result_id, campaign_id, run_id, company_id_value, company_name, domain,
+                    str(row.get("industry", "") or ""), str(country_value or ""),
+                    str(row.get("size", row.get("estimated_employee_count", row.get("employee_count", ""))) or ""),
+                    str(row.get("type", row.get("company_type", "")) or ""), str(location_text or ""),
+                    str(row.get("description", "") or ""), linkedin_url,
+                    str(row.get("annual_revenue", "") or ""), json.dumps(row, ensure_ascii=False),
+                    created_at, linkedin_url,
                 ),
             )
-            conn.execute(
-                "UPDATE clay_company_results SET company_linkedin_url = ? WHERE id = ?",
-                (str(row.get("linkedin_url", row.get("company_linkedin_url", row.get("social_url", ""))) or ""),
-                 conn.execute("SELECT id FROM clay_company_results WHERE search_run_id = ? ORDER BY rowid DESC LIMIT 1", (run_id,)).fetchone()[0]),
-            )
+            if linkedin_url:
+                company_linkedin_urls.append(linkedin_url)
+            if domain:
+                company_domains.append(domain.lower())
+            export_records.append({
+                "campaign_id": campaign_id,
+                "campaign_name": str(campaign.get("name", "") or ""),
+                "clay_company_id": company_id_value,
+                "company_name": company_name,
+                "domain": domain,
+                "industry": str(row.get("industry", "") or ""),
+                "country": str(country_value or ""),
+                "employee_count": str(row.get("size", row.get("estimated_employee_count", row.get("employee_count", ""))) or ""),
+                "company_type": str(row.get("type", row.get("company_type", "")) or ""),
+                "location": str(location_text or ""),
+                "description": str(row.get("description", "") or ""),
+                "company_linkedin_url": linkedin_url,
+                "annual_revenue": str(row.get("annual_revenue", "") or ""),
+                "clay_search_id": clay_search_id,
+                "search_run_id": run_id,
+                "raw_clay_data": json.dumps(row, ensure_ascii=False),
+            })
 
         conn.execute(
             "UPDATE campaigns SET status = ? WHERE id = ?",
             ("Company Search Complete" if rows else "No Companies Found", campaign_id),
         )
         conn.commit()
-        company_linkedin_urls = list(dict.fromkeys(
-            str(value).strip()
-            for row in rows
-            for value in [
-                row.get("linkedin_url") or row.get("company_linkedin_url")
-                or row.get("linkedin_url_company") or row.get("social_url")
-            ]
-            if str(value or "").strip()
-        ))
-        company_domains = list(dict.fromkeys(
-            str(row.get("domain", "")).strip().lower()
-            for row in rows if str(row.get("domain", "")).strip()
-        ))
-        # Prefer LinkedIn company URLs for Clay's account matching. Use a domain
-        # only for companies that do not have a LinkedIn company URL.
-        rows_without_linkedin = [
-            row for row in rows
-            if not str(
-                row.get("linkedin_url") or row.get("company_linkedin_url")
-                or row.get("linkedin_url_company") or row.get("social_url") or ""
-            ).strip()
-        ]
+
+        company_linkedin_urls = list(dict.fromkeys(company_linkedin_urls))
+        company_domains = list(dict.fromkeys(company_domains))
+        rows_without_linkedin = [record for record in export_records if not record.get("company_linkedin_url")]
         fallback_domains = list(dict.fromkeys(
-            str(row.get("domain", "")).strip().lower()
-            for row in rows_without_linkedin if str(row.get("domain", "")).strip()
+            str(record.get("domain", "")).strip().lower()
+            for record in rows_without_linkedin if record.get("domain")
         ))
         company_identifiers = list(dict.fromkeys(company_linkedin_urls + fallback_domains))
         company_match_identifiers = list(dict.fromkeys(company_linkedin_urls + company_domains))
-
         return {
-            "run_id": run_id,
-            "search_id": clay_search_id,
-            "query": query_text,
-            "count": len(rows),
-            "has_more": has_more,
-            "company_domains": company_domains,
-            "company_linkedin_urls": company_linkedin_urls,
+            "run_id": run_id, "search_id": clay_search_id, "query": query_text,
+            "count": len(rows), "has_more": has_more, "page_count": page_count,
+            "company_domains": company_domains, "company_linkedin_urls": company_linkedin_urls,
             "company_identifiers": company_identifiers,
             "company_match_identifiers": company_match_identifiers,
+            "records": export_records, "validation_note": validation_note,
         }
     except Exception as exc:
         existing_run = conn.execute("SELECT 1 FROM clay_search_runs WHERE id = ?", (run_id,)).fetchone()
@@ -937,15 +1065,14 @@ def run_clay_company_search(campaign, campaign_id, api_key):
                    VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)""",
                 (run_id, campaign_id, clay_search_id, query_text, "Failed", str(exc)[:1000], created_at),
             )
-        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Clay Company Search Failed", campaign_id))
+        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Company Search Failed", campaign_id))
         conn.commit()
         raise
 
-
-
 def fetch_clay_people_filter_schema(api_key):
     """Read Clay's live people-search fields before sending controlled filters."""
-    response = requests.get(
+    response = _clay_api_request(
+        "GET",
         "https://api.clay.com/public/v0/search/filters-mode/fields",
         headers={"clay-api-key": api_key},
         params={"source_type": "people"},
@@ -961,23 +1088,26 @@ def fetch_clay_people_filter_schema(api_key):
     return {field.get("name"): field for field in fields if field.get("name")}
 
 
-def _clay_filter_values(schema_field, values, label):
-    """Map requested values to Clay's live controlled vocabulary when available."""
-    values = [str(value).strip() for value in values if str(value).strip()]
-    allowed = schema_field.get("allowed_values") or schema_field.get("allowedValues") or []
-    if not allowed:
-        return values
-
-    # Clay schemas may expose allowed values as strings or small value objects.
-    allowed_strings = []
+def _field_allowed_values(schema_field):
+    """Return normalized Clay allowed-values strings, including object-shaped schema values."""
+    allowed = (schema_field or {}).get("allowed_values") or (schema_field or {}).get("allowedValues") or []
+    values = []
     for item in allowed:
         if isinstance(item, dict):
             item = item.get("value") or item.get("name") or item.get("label") or item.get("id")
         if item not in (None, ""):
-            allowed_strings.append(str(item))
+            values.append(str(item).strip())
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _clay_filter_values(schema_field, values, label):
+    """Validate/map controlled Clay vocabulary; pass free-text values through unchanged."""
+    values = [str(value).strip() for value in values if str(value).strip()]
+    allowed_strings = _field_allowed_values(schema_field)
+    if not allowed_strings:
+        return values
     allowed_lookup = {value.casefold(): value for value in allowed_strings}
-    mapped = []
-    missing = []
+    mapped, missing = [], []
     for value in values:
         canonical = allowed_lookup.get(value.casefold())
         if canonical:
@@ -1058,7 +1188,7 @@ def _expand_seniority_for_job_level(campaign):
 
 
 def build_clay_people_filters(campaign, company_identifiers, people_schema):
-    """Build Clay people filters, applying title, seniority, location and account scope."""
+    """Build Clay people filters using the live schema and target-company scope."""
     if not company_identifiers:
         raise ValueError("No company LinkedIn URLs or domains were returned, so contact search cannot be safely scoped.")
 
@@ -1068,7 +1198,7 @@ def build_clay_people_filters(campaign, company_identifiers, people_schema):
             "Clay's live people-search schema does not expose company_identifier. "
             "The dashboard stopped rather than running an unscoped contact search."
         )
-    filters["company_identifier"] = list(dict.fromkeys(company_identifiers))
+    filters["company_identifier"] = list(dict.fromkeys(str(value).strip() for value in company_identifiers if str(value).strip()))
 
     contact_countries = [
         normalize_country_name(value).title()
@@ -1078,25 +1208,23 @@ def build_clay_people_filters(campaign, company_identifiers, people_schema):
         field = people_schema.get("location_countries_include")
         if not field:
             raise RuntimeError("Clay's current people-search schema does not expose location_countries_include.")
-        filters["location_countries_include"] = _clay_filter_values(
-            field, contact_countries, "Contact Country"
-        )
+        filters["location_countries_include"] = _clay_filter_values(field, contact_countries, "Contact Country")
 
     title_values = split_clay_values(campaign.get("target_titles", ""))
-    if title_values and not any(value.casefold() in ("any", "all") for value in title_values):
+    title_values = [value for value in title_values if value.casefold() not in ("any", "all")]
+    if title_values:
         field = people_schema.get("job_title_keywords")
         if not field:
             raise RuntimeError("Clay's current people-search schema does not expose job_title_keywords.")
-        # This is a free-text keyword filter in Clay. Keep each keyword as a
-        # separate list item; Clay's schema does not provide a controlled list.
-        filters["job_title_keywords"] = [value.casefold() for value in title_values]
-        # The API exposes the match mode on some schema versions. Use literal
-        # substring matching when Clay advertises that field; otherwise the
-        # result processor below enforces the same contains behaviour locally.
-        if "job_title_mode" in people_schema:
-            filters["job_title_mode"] = _clay_filter_values(
-                people_schema["job_title_mode"], ["contain"], "Job Title Match Mode"
-            )
+        filters["job_title_keywords"] = title_values
+        # Smart matching is preferable to strict substring matching because it covers common title variations.
+        mode_field = people_schema.get("job_title_mode")
+        if mode_field:
+            allowed_modes = [value.casefold() for value in _field_allowed_values(mode_field)]
+            if not allowed_modes or "smart" in allowed_modes:
+                filters["job_title_mode"] = "smart"
+            elif "contain" in allowed_modes:
+                filters["job_title_mode"] = "contain"
 
     seniority_values = _expand_seniority_for_job_level(campaign)
     if seniority_values:
@@ -1107,8 +1235,10 @@ def build_clay_people_filters(campaign, company_identifiers, people_schema):
             field, seniority_values, "Seniority / Job Level"
         )
 
-    department_values = split_clay_values(campaign.get("department", ""))
-    department_values = [value for value in department_values if value.casefold() not in ("any", "all")]
+    department_values = [
+        value for value in split_clay_values(campaign.get("department", ""))
+        if value.casefold() not in ("any", "all")
+    ]
     if department_values:
         field = people_schema.get("job_functions")
         if not field:
@@ -1310,98 +1440,49 @@ def _normalize_company_match_identifier(value):
 
 
 def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, company_match_identifiers=None):
-    """Search people at the exact companies from the preceding company-search run."""
-    # Reload the saved campaign immediately before constructing filters. This
-    # prevents a stale in-memory campaign object from dropping the saved Job
-    # Level operator (e.g. Head + Above) from the Clay request.
+    """Search people at the companies returned by the preceding company search."""
     campaign = campaign_as_dict(campaign_id) or campaign
-    people_schema = fetch_clay_people_filter_schema(api_key)
-    filters = build_clay_people_filters(campaign, company_identifiers, people_schema)
-    match_values = company_match_identifiers or company_identifiers
-    query_text = json.dumps(
-        {"source_type": "people", "filters": filters},
-        ensure_ascii=False,
-        indent=2,
-    )
-    headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
-    base_url = "https://api.clay.com/public/v0"
     created_at = datetime.now().isoformat(timespec="seconds")
     run_id = str(uuid.uuid4())
     clay_search_id = ""
-
+    query_text = "{}"
     try:
-        create_response = requests.post(
-            f"{base_url}/search/filters-mode",
-            headers=headers,
-            json={"source_type": "people", "filters": filters},
-            timeout=30,
+        # Schema retrieval and filter construction are inside try so every failure is logged.
+        people_schema = fetch_clay_people_filter_schema(api_key)
+        filters = build_clay_people_filters(campaign, company_identifiers, people_schema)
+        query_text = json.dumps({"source_type": "people", "filters": filters}, ensure_ascii=False, indent=2)
+        headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
+        base_url = "https://api.clay.com/public/v0"
+
+        create_response = _clay_api_request(
+            "POST", f"{base_url}/search/filters-mode", headers=headers,
+            json_body={"source_type": "people", "filters": filters}, timeout=40,
         )
         if not create_response.ok:
             raise RuntimeError(
-                f"Clay contact search creation failed (HTTP {create_response.status_code}): "
-                f"{create_response.text[:1000]}"
+                f"Clay contact search creation failed (HTTP {create_response.status_code}): {create_response.text[:1000]}"
             )
-        clay_search_id = create_response.json().get("search_id", "")
+        create_payload = _clay_json(create_response, "contact search creation")
+        clay_search_id = str(create_payload.get("search_id", "") or "")
         if not clay_search_id:
             raise RuntimeError("Clay did not return a contact search ID.")
 
-        # Clay's current plan allows a maximum of 50 results for this search.
-        # Request the results exactly once; do not attempt subsequent pages,
-        # because each additional request can exceed the plan's per-search cap.
-        results_response = requests.post(
-            f"{base_url}/search/filters-mode/{clay_search_id}/run",
-            headers=headers,
-            json={"limit": 50},
-            timeout=45,
+        raw_rows, has_more, page_count = collect_clay_search_results(
+            api_key, clay_search_id, "people", max_results=200, page_size=20
         )
-        if not results_response.ok:
-            raise RuntimeError(
-                f"Clay contact results request failed (HTTP {results_response.status_code}): "
-                f"{results_response.text[:1000]}"
-            )
-        page_payload = results_response.json()
-        raw_rows = page_payload.get("data", []) or []
-        has_more = bool(page_payload.get("has_more", False))
-        # Do not request another page. `has_more` is shown in the dashboard so
-        # the user knows Clay had additional matches beyond the 50-result cap.
-
-        # Defense in depth: compare the current employer against BOTH LinkedIn
-        # URLs and domains returned by the company search. The API search itself
-        # is already scoped by company_identifier (LinkedIn URL preferred).
+        match_values = company_match_identifiers or company_identifiers
         approved_ids = {
             _normalize_company_match_identifier(value)
             for value in match_values if _normalize_company_match_identifier(value)
         }
-        rows = []
-        rejected_count = 0
-        rejected_title_count = 0
-        unverified_employer_count = 0
+
+        rows, rejected_employer_count, unverified_employer_count = [], 0, 0
         profiles_with_title = 0
         profiles_with_current_experience = 0
-        rejected_title_samples = []
-        requested_title_keywords = [
-            value.casefold() for value in split_clay_values(campaign.get("target_titles", ""))
-            if value.casefold() not in ("any", "all")
-        ]
         for raw_row in raw_rows:
             person = _parse_clay_person_row(raw_row)
             profiles_with_title += int(bool(person["job_title"]))
             profiles_with_current_experience += int(person["has_current_experience"])
-            # The parser now prioritizes the current role over a generic headline.
-            # Keep this local check as a safety check against mismatched results.
-            if requested_title_keywords and not any(
-                keyword in person["job_title"].casefold() for keyword in requested_title_keywords
-            ):
-                rejected_title_count += 1
-                if len(rejected_title_samples) < 10:
-                    rejected_title_samples.append({
-                        "parsed_title": person["job_title"],
-                        "title_source": person["job_title_source"],
-                        "available_title_fields": person["title_candidates"],
-                        "has_current_experience": person["has_current_experience"],
-                        "top_level_keys": sorted(str(key) for key in raw_row.keys()) if isinstance(raw_row, dict) else [],
-                    })
-                continue
             current_ids = {
                 _normalize_company_match_identifier(person["company_linkedin_url"]),
                 _normalize_company_match_identifier(person["company_domain"]),
@@ -1410,33 +1491,26 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
             if current_ids.intersection(approved_ids):
                 rows.append((raw_row, person))
             elif current_ids:
-                # A positive but conflicting employer identifier is rejected.
-                rejected_count += 1
+                rejected_employer_count += 1
+                continue
             else:
-                # Some Clay people-search records omit employer identifiers.
-                # Keep them because the API request was already scoped to the
-                # approved company identifiers; record this for transparent QA.
+                # Clay's request was already scoped to target companies. Keep rows missing an employer URL,
+                # but make the count visible so sales can spot-check the results.
                 unverified_employer_count += 1
                 rows.append((raw_row, person))
-            if len(rows) >= 50:
-                break
 
-        diagnostic_data = {
+        debug_data = {
             "raw_profile_count": len(raw_rows),
             "retained_profile_count": len(rows),
-            "requested_title_keywords": requested_title_keywords,
-            "title_filter_rejected_count": rejected_title_count,
-            "employer_mismatch_rejected_count": rejected_count,
+            "employer_mismatch_rejected_count": rejected_employer_count,
             "retained_without_employer_identifier_count": unverified_employer_count,
             "profiles_with_parsed_title_count": profiles_with_title,
             "profiles_with_current_experience_count": profiles_with_current_experience,
-            "rejected_title_samples": rejected_title_samples,
+            "title_filtering": "Applied by Clay Search API; no second strict substring filter applied locally.",
         }
-        diagnostic_json = json.dumps(diagnostic_data, ensure_ascii=False)
-        run_summary = (
-            f"Clay returned {len(raw_rows)} profiles (maximum 50 for this search); "
-            f"retained {len(rows)}; excluded {rejected_title_count} outside the requested title keywords "
-            f"and {rejected_count} with a conflicting employer identifier; "
+        summary = (
+            f"Clay returned {len(raw_rows)} profiles across {page_count} page(s); retained {len(rows)}; "
+            f"excluded {rejected_employer_count} with a conflicting employer; "
             f"retained {unverified_employer_count} without employer identifiers under the company-scoped search."
         )
         conn.execute(
@@ -1444,9 +1518,10 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
                (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, debug_json, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (run_id, campaign_id, clay_search_id, query_text, len(rows), int(has_more), "Complete",
-             run_summary, diagnostic_json, created_at),
+             summary, json.dumps(debug_data, ensure_ascii=False), created_at),
         )
 
+        export_records = []
         for raw_row, person in rows:
             conn.execute(
                 """INSERT INTO clay_people_results
@@ -1462,28 +1537,106 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
                     person["linkedin_url"], json.dumps(raw_row, ensure_ascii=False), created_at,
                 ),
             )
+            export_records.append({
+                "campaign_id": campaign_id,
+                "campaign_name": str(campaign.get("name", "") or ""),
+                "clay_profile_id": person["clay_profile_id"],
+                "full_name": person["full_name"],
+                "first_name": person["first_name"],
+                "last_name": person["last_name"],
+                "job_title": person["job_title"],
+                "seniority": person["seniority"],
+                "department": person["department"],
+                "location": person["location"],
+                "location_country": person["location_country"],
+                "company_name": person["company_name"],
+                "company_domain": person["company_domain"],
+                "company_linkedin_url": person["company_linkedin_url"],
+                "linkedin_url": person["linkedin_url"],
+                "clay_search_id": clay_search_id,
+                "search_run_id": run_id,
+                "raw_clay_data": json.dumps(raw_row, ensure_ascii=False),
+            })
         conn.commit()
         return {
-            "run_id": run_id,
-            "search_id": clay_search_id,
-            "query": query_text,
-            "count": len(rows),
-            "raw_count": len(raw_rows),
-            "rejected_count": rejected_count,
-            "rejected_title_count": rejected_title_count,
+            "run_id": run_id, "search_id": clay_search_id, "query": query_text,
+            "count": len(rows), "raw_count": len(raw_rows),
+            "rejected_count": rejected_employer_count,
             "unverified_employer_count": unverified_employer_count,
-            "has_more": has_more,
+            "has_more": has_more, "page_count": page_count, "records": export_records,
         }
     except Exception as exc:
         conn.execute(
             """INSERT INTO clay_people_search_runs
-               (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, created_at)
-               VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?)""",
-            (run_id, campaign_id, clay_search_id, query_text, "Failed", str(exc)[:1000], created_at),
+               (id, campaign_id, clay_search_id, query_text, result_count, has_more, status, error_message, debug_json, created_at)
+               VALUES (?, ?, ?, ?, 0, 0, ?, ?, ?, ?)""",
+            (run_id, campaign_id, clay_search_id, query_text, "Failed", str(exc)[:1000], "{}", created_at),
         )
+        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Contact Search Failed", campaign_id))
         conn.commit()
         raise
 
+
+def is_valid_https_url(value):
+    value = str(value or "").strip()
+    parsed = urlparse(value)
+    return parsed.scheme == "https" and bool(parsed.netloc)
+
+
+def _webhook_idempotency_key(campaign_id, entity_type, record):
+    if entity_type == "company":
+        stable_value = record.get("clay_company_id") or record.get("domain") or record.get("company_linkedin_url") or record.get("company_name")
+    else:
+        stable_value = record.get("clay_profile_id") or record.get("linkedin_url") or "|".join([
+            str(record.get("full_name", "")), str(record.get("company_domain", "")), str(record.get("job_title", ""))
+        ])
+    source = f"{campaign_id}|{entity_type}|{stable_value or json.dumps(record, sort_keys=True, default=str)}"
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def send_records_to_clay_webhook(webhook_url, auth_token, campaign_id, entity_type, records):
+    """Send normalized search results into an existing Clay webhook table with retry-safe keys."""
+    if not records:
+        return {"sent": 0, "failed": 0}
+    webhook_url = str(webhook_url or "").strip()
+    parsed = urlparse(webhook_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError(f"The Clay {entity_type} webhook URL must be a valid HTTPS URL.")
+
+    sent, failures = 0, []
+    for index, record in enumerate(records, start=1):
+        headers = {
+            "Content-Type": "application/json",
+            "x-clay-webhook-idempotency-key": _webhook_idempotency_key(campaign_id, entity_type, record),
+        }
+        if str(auth_token or "").strip():
+            headers["x-clay-webhook-auth"] = str(auth_token).strip()
+        last_error = ""
+        for attempt in range(3):
+            try:
+                response = requests.post(webhook_url, headers=headers, json=record, timeout=20)
+                if 200 <= response.status_code < 300:
+                    sent += 1
+                    last_error = ""
+                    break
+                last_error = f"HTTP {response.status_code}: {response.text[:350]}"
+                if response.status_code not in {408, 425, 429, 500, 502, 503, 504} or attempt == 2:
+                    break
+                time.sleep(min(6, 2 ** attempt))
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                if attempt == 2:
+                    break
+                time.sleep(min(6, 2 ** attempt))
+        if last_error:
+            failures.append({"record": index, "error": last_error})
+    if failures:
+        examples = "; ".join(f"row {item['record']}: {item['error']}" for item in failures[:3])
+        raise RuntimeError(
+            f"Clay {entity_type} table received {sent}/{len(records)} records. "
+            f"{len(failures)} failed after retries. {examples}"
+        )
+    return {"sent": sent, "failed": 0}
 
 def load_latest_clay_people_search(campaign_id):
     run = conn.execute(
@@ -1719,13 +1872,13 @@ def show_edit_campaign_dialog(campaign_id):
         cms_col, score_col = st.columns(2)
         with cms_col:
             edit_current_cms = st.text_input(
-                "Current CMS",
+                "Current CMS (enrich in Clay after review)",
                 value=str(campaign.get("current_cms") or ""),
-                help="Multiple CMS platforms are allowed, e.g. WordPress, Drupal, Sitecore.",
+                help="For this phase, the dashboard does not filter by CMS. Sales will run Clay's website technology/CMS enrichment after reviewing companies.",
             )
         with score_col:
             edit_min_score = st.slider(
-                "Minimum company and contact ICP score",
+                "Minimum ICP score (review target)",
                 min_value=0,
                 max_value=100,
                 value=int(campaign.get("min_score", 0) or 0),
@@ -1777,12 +1930,36 @@ def show_edit_campaign_dialog(campaign_id):
             value=str(campaign.get("email_sequence_instructions", "") or ""),
             height=120,
         )
+        st.markdown("**Clay destination for this campaign**")
         edit_clay_table_url = st.text_input(
-            "Clay Table Link (optional)",
+            "Clay Workbook Link",
             value=str(campaign.get("clay_table_url", "") or ""),
-            placeholder="Paste the Clay table URL here when available",
-            help="Optional reference link to a Clay table created separately.",
+            placeholder="Paste the Clay workbook URL",
+            help="The sales team will open this workbook to review the sourced companies and contacts.",
         )
+        edit_companies_webhook = st.text_input(
+            "Companies Table Webhook URL",
+            value=str(campaign.get("clay_companies_webhook_url", "") or ""),
+            placeholder="Paste the webhook URL from the Clay Companies table",
+            help="Create a Webhooks → Monitor webhook source in the Companies table and paste its HTTPS URL here.",
+        )
+        edit_contacts_webhook = st.text_input(
+            "Contacts Table Webhook URL",
+            value=str(campaign.get("clay_contacts_webhook_url", "") or ""),
+            placeholder="Paste the webhook URL from the Clay Contacts table",
+            help="Create a Webhooks → Monitor webhook source in the Contacts table and paste its HTTPS URL here.",
+        )
+        with st.expander("Optional webhook authentication", expanded=False):
+            edit_companies_webhook_auth = st.text_input(
+                "Companies Webhook Auth Token",
+                value=str(campaign.get("clay_companies_webhook_auth", "") or ""),
+                type="password",
+            )
+            edit_contacts_webhook_auth = st.text_input(
+                "Contacts Webhook Auth Token",
+                value=str(campaign.get("clay_contacts_webhook_auth", "") or ""),
+                type="password",
+            )
         save_changes = st.form_submit_button("Save Changes", type="primary", use_container_width=True)
 
     cancel_col, _ = st.columns([1, 4])
@@ -1799,14 +1976,29 @@ def show_edit_campaign_dialog(campaign_id):
             st.error("Select at least one seniority level, or choose Job Level = Any.")
         else:
             owner_value = edit_owner.strip() or "Unassigned"
+            original_campaign = campaign_as_dict(campaign_id) or {}
+            search_criteria_fields = {
+                "industry": edit_industry.strip(),
+                "company_country": edit_company_country.strip(),
+                "contact_country": edit_contact_country.strip(),
+                "target_titles": edit_target_titles.strip(),
+                "department": edit_department.strip(),
+                "seniority": ", ".join(edit_seniority),
+                "job_level": edit_job_level,
+            }
+            criteria_changed = any(
+                str(original_campaign.get(field, "") or "").strip() != str(value or "").strip()
+                for field, value in search_criteria_fields.items()
+            )
             conn.execute(
                 """
                 UPDATE campaigns
                 SET name = ?, campaign_owner = ?, industry = ?, company_country = ?,
                     contact_country = ?, target_titles = ?, min_score = ?, current_cms = ?,
                     department = ?, seniority = ?, job_level = ?,
-                    email_sequence_instructions = ?, clay_table_url = ?, status = ?,
-                    criteria_approved = 0, criteria_approved_by = '', criteria_approved_at = ''
+                    email_sequence_instructions = ?, clay_table_url = ?,
+                    clay_companies_webhook_url = ?, clay_contacts_webhook_url = ?,
+                    clay_companies_webhook_auth = ?, clay_contacts_webhook_auth = ?
                 WHERE id = ?
                 """,
                 (
@@ -1815,23 +2007,38 @@ def show_edit_campaign_dialog(campaign_id):
                     edit_target_titles.strip(), int(edit_min_score), edit_current_cms.strip(),
                     edit_department.strip(), ", ".join(edit_seniority), edit_job_level,
                     edit_email_instructions.strip(), edit_clay_table_url.strip(),
-                    "Draft", campaign_id,
+                    edit_companies_webhook.strip(), edit_contacts_webhook.strip(),
+                    edit_companies_webhook_auth.strip(), edit_contacts_webhook_auth.strip(),
+                    campaign_id,
                 ),
             )
 
-            # Criteria edits invalidate the previous approval and the campaign's previous search output.
-            conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (campaign_id,))
-            conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (campaign_id,))
-            conn.execute("DELETE FROM leads WHERE campaign_id = ?", (campaign_id,))
+            if criteria_changed:
+                conn.execute(
+                    """UPDATE campaigns SET status = 'Draft', criteria_approved = 0,
+                       criteria_approved_by = '', criteria_approved_at = '',
+                       industry_clay_value = '', industry_mapping_status = '' WHERE id = ?""",
+                    (campaign_id,),
+                )
+                conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (campaign_id,))
+                conn.execute("DELETE FROM clay_people_results WHERE campaign_id = ?", (campaign_id,))
+                conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (campaign_id,))
+                conn.execute("DELETE FROM clay_people_search_runs WHERE campaign_id = ?", (campaign_id,))
+                conn.execute("DELETE FROM leads WHERE campaign_id = ?", (campaign_id,))
+                notice_text = (
+                    "Campaign criteria updated. Approve the revised criteria before running a new Clay search. "
+                    "The dashboard cannot delete rows already sent to Clay, so clear the existing Companies and Contacts tables "
+                    "or connect fresh webhook tables before rebuilding to avoid mixing old and new results."
+                )
+                activity_details = "Search criteria changed. Previous approval and search results were cleared; re-approval is required."
+                activity_action = "Campaign criteria updated"
+            else:
+                notice_text = "Campaign details and Clay workbook settings saved. Existing criteria approval and search results were preserved."
+                activity_details = "Campaign metadata / Clay workbook connection settings updated; search criteria were unchanged."
+                activity_action = "Campaign settings updated"
             conn.commit()
-            log_activity(
-                "Campaign criteria updated", campaign_id, edit_name.strip(), owner_value,
-                "Criteria changed. Previous approval and Clay search results were cleared; "
-                "approve the updated criteria before searching again.",
-            )
-            st.session_state["campaign_edit_notice"] = (
-                "Campaign updated. Please approve the revised criteria before running a new Clay search."
-            )
+            log_activity(activity_action, campaign_id, edit_name.strip(), owner_value, activity_details)
+            st.session_state["campaign_edit_notice"] = notice_text
             st.session_state["active_campaign_id"] = campaign_id
             st.session_state["run_campaign_selector"] = campaign_id
             st.session_state["lead_campaign_selector"] = campaign_id
@@ -2043,7 +2250,10 @@ def show_create_campaign_dialog():
                 help="Enter multiple titles separated by commas. Leave blank for any job title.",
             )
         with cms_col:
-            current_cms = st.text_input("Current CMS", value="")
+            current_cms = st.text_input(
+                "Current CMS (enrich in Clay after review)", value="",
+                help="Not used as a search filter in this phase. Sales will enrich CMS in Clay after reviewing companies."
+            )
 
         seniority_col, job_level_col = st.columns(2)
         with seniority_col:
@@ -2063,11 +2273,25 @@ def show_create_campaign_dialog():
             help="0 means no minimum score filter.",
         )
 
-        with st.expander("Additional options (optional)", expanded=False):
+        with st.expander("Clay workbook and optional instructions", expanded=False):
             clay_table_url = st.text_input(
-                "Clay Table Link",
+                "Clay Workbook Link",
                 value="",
+                help="Paste the workbook link after creating the campaign's Clay workbook and its two tables.",
             )
+            clay_companies_webhook_url = st.text_input(
+                "Companies Table Webhook URL",
+                value="",
+                help="Create a Webhooks → Monitor webhook source in the Companies table, then paste the HTTPS URL here.",
+            )
+            clay_contacts_webhook_url = st.text_input(
+                "Contacts Table Webhook URL",
+                value="",
+                help="Create a Webhooks → Monitor webhook source in the Contacts table, then paste the HTTPS URL here.",
+            )
+            with st.expander("Optional webhook authentication", expanded=False):
+                clay_companies_webhook_auth = st.text_input("Companies Webhook Auth Token", value="", type="password")
+                clay_contacts_webhook_auth = st.text_input("Contacts Webhook Auth Token", value="", type="password")
             email_sequence_instructions = st.text_area(
                 "Email Sequence Instructions",
                 value="",
@@ -2087,8 +2311,10 @@ def show_create_campaign_dialog():
                 INSERT INTO campaigns
                 (id, name, industry, company_country, contact_country, target_titles,
                  min_score, status, created_at, current_cms, department, seniority,
-                 job_level, email_sequence_instructions, clay_table_url, campaign_owner)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 job_level, email_sequence_instructions, clay_table_url, campaign_owner,
+                 clay_companies_webhook_url, clay_contacts_webhook_url,
+                 clay_companies_webhook_auth, clay_contacts_webhook_auth)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     campaign_id,
@@ -2107,6 +2333,10 @@ def show_create_campaign_dialog():
                     email_sequence_instructions.strip(),
                     clay_table_url.strip(),
                     owner_value,
+                    clay_companies_webhook_url.strip(),
+                    clay_contacts_webhook_url.strip(),
+                    clay_companies_webhook_auth.strip(),
+                    clay_contacts_webhook_auth.strip(),
                 ),
             )
             conn.commit()
@@ -2169,7 +2399,7 @@ if active_page == "Campaigns":
                 "created_at": "Created Date",
                 "campaign_owner": "Campaign Owner",
                 "status": "Status",
-                "clay_table_url": "List Link (Clay Table)",
+                "clay_table_url": "Clay Workbook",
             }
         )
         campaign_preview = campaign_preview[
@@ -2179,7 +2409,7 @@ if active_page == "Campaigns":
                 "Created Date",
                 "Campaign Owner",
                 "Status",
-                "List Link (Clay Table)",
+                "Clay Workbook",
             ]
         ]
         campaign_ids = campaigns["id"].tolist()
@@ -2198,9 +2428,9 @@ if active_page == "Campaigns":
             on_select="rerun",
             selection_mode="single-row",
             column_config={
-                "List Link (Clay Table)": st.column_config.LinkColumn(
-                    "List Link (Clay Table)",
-                    display_text="Open Clay Table",
+                "Clay Workbook": st.column_config.LinkColumn(
+                    "Clay Workbook",
+                    display_text="Open Clay Workbook",
                 )
             },
             key="campaign_preview_table",
@@ -2303,9 +2533,28 @@ if active_page == "Campaigns":
                         st.rerun()
                 else:
                     st.caption("View Only")
+            campaign_destination = campaign_as_dict(selected_id) or {}
+            workbook_url = str(campaign_destination.get("clay_table_url", "") or "").strip()
+            companies_webhook_url = str(campaign_destination.get("clay_companies_webhook_url", "") or "").strip()
+            contacts_webhook_url = str(campaign_destination.get("clay_contacts_webhook_url", "") or "").strip()
+            destination_ready = all(is_valid_https_url(value) for value in (
+                workbook_url, companies_webhook_url, contacts_webhook_url
+            ))
+            company_search_criteria_ready = bool(
+                split_clay_values(selected_row.get("industry", ""))
+                or split_clay_values(selected_row.get("company_country", ""))
+            )
             with build_col:
                 if mapping_needs_review:
                     st.caption("Review the suggested Clay industry before approving.")
+                if not selected_approved:
+                    st.caption("Approve campaign criteria first.")
+                elif not clay_api_key:
+                    st.caption("Clay API key is not configured.")
+                elif not company_search_criteria_ready:
+                    st.caption("Add Industry or Company Country. Current CMS is enriched after review in Clay.")
+                elif not destination_ready:
+                    st.caption("Add the Clay workbook link and both table webhook URLs in Edit Campaign.")
                 if st.button(
                     "Build Campaign Data",
                     key="build_campaign_data_clay",
@@ -2315,39 +2564,97 @@ if active_page == "Campaigns":
                         not selected_approved or not clay_api_key
                         or selected_permission not in ("Owner", "Can Edit")
                         or not mapping_ready or bool(industry_mapping_error) or mapping_needs_review
+                        or not company_search_criteria_ready or not destination_ready
                     ),
                 ):
                     campaign_for_clay = campaign_as_dict(selected_id) or {}
+                    stage = "Company Search"
                     try:
-                        with st.spinner("Searching Clay for companies, then matching contacts using the campaign title, seniority, department, location and company filters..."):
+                        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Company Search Running", selected_id))
+                        conn.commit()
+                        with st.spinner("Searching companies in Clay, finding matching contacts, and sending both lists to this campaign's Clay workbook..."):
                             clay_result = run_clay_company_search(campaign_for_clay, selected_id, clay_api_key)
-                            if clay_result["company_identifiers"]:
-                                people_result = run_clay_people_search(
-                                    campaign_for_clay, selected_id, clay_api_key,
-                                    clay_result["company_identifiers"],
-                                    clay_result.get("company_match_identifiers", clay_result["company_identifiers"]),
-                                )
-                            else:
-                                people_result = {
-                                    "count": 0, "search_id": "", "has_more": False,
-                                    "query": "Contact search skipped because no company identifiers were returned."
+                            if clay_result["count"] == 0:
+                                conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("No Companies Found", selected_id))
+                                conn.commit()
+                                st.session_state["clay_search_notice"] = {
+                                    "state": "no_companies", "company_count": 0,
+                                    "company_search_id": clay_result.get("search_id", ""),
+                                    "validation_note": clay_result.get("validation_note", ""),
                                 }
+                                log_activity(
+                                    "Clay company search completed with no results", selected_id, selected_name,
+                                    current_mock_user_name,
+                                    f"Clay returned no companies. Search ID: {clay_result.get('search_id', '')}",
+                                )
+                                st.rerun()
+
+                            if not clay_result.get("company_identifiers"):
+                                raise RuntimeError(
+                                    "Clay returned companies, but none had a company LinkedIn URL or domain. "
+                                    "The dashboard cannot safely search contacts for these records."
+                                )
+
+                            stage = "Contact Search"
+                            conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Contact Search Running", selected_id))
+                            conn.commit()
+                            people_result = run_clay_people_search(
+                                campaign_for_clay, selected_id, clay_api_key,
+                                clay_result["company_identifiers"],
+                                clay_result.get("company_match_identifiers", clay_result["company_identifiers"]),
+                            )
+
+                            stage = "Clay Workbook Delivery"
+                            conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", ("Sending Results to Clay", selected_id))
+                            conn.commit()
+                            company_delivery = send_records_to_clay_webhook(
+                                companies_webhook_url,
+                                campaign_for_clay.get("clay_companies_webhook_auth", ""),
+                                selected_id, "company", clay_result.get("records", []),
+                            )
+                            contact_delivery = send_records_to_clay_webhook(
+                                contacts_webhook_url,
+                                campaign_for_clay.get("clay_contacts_webhook_auth", ""),
+                                selected_id, "person", people_result.get("records", []),
+                            )
+
+                            final_status = "Ready for Review" if people_result["count"] else "Ready for Review - No Contacts Found"
+                            conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", (final_status, selected_id))
+                            conn.commit()
+
                         log_activity(
-                            "Clay company and contact searches completed", selected_id, selected_name, current_mock_user_name,
-                            f"Retrieved {clay_result['count']} companies and {people_result['count']} contacts.",
+                            "Clay database built and published", selected_id, selected_name, current_mock_user_name,
+                            f"Companies: {company_delivery['sent']}; contacts: {contact_delivery['sent']}; "
+                            f"company search: {clay_result['search_id']}; people search: {people_result['search_id']}; "
+                            f"workbook: {workbook_url}",
                         )
                         st.session_state["clay_search_notice"] = {
-                            "success": True,
-                            "count": clay_result["count"],
-                            "has_more": clay_result["has_more"],
-                            "search_id": clay_result["search_id"],
-                            "people_count": people_result["count"],
-                            "people_search_id": people_result.get("search_id", ""),
+                            "state": "ready", "company_count": clay_result["count"],
+                            "contact_count": people_result["count"],
+                            "company_has_more": clay_result["has_more"],
+                            "contact_has_more": people_result["has_more"],
+                            "company_pages": clay_result.get("page_count", 1),
+                            "contact_pages": people_result.get("page_count", 1),
+                            "workbook_url": workbook_url,
+                            "validation_note": clay_result.get("validation_note", ""),
+                            "unverified_employer_count": people_result.get("unverified_employer_count", 0),
                         }
                         st.rerun()
                     except Exception as exc:
-                        log_activity("Clay company search failed", selected_id, selected_name, current_mock_user_name, str(exc)[:500])
-                        st.session_state["clay_search_notice"] = {"success": False, "error": str(exc)}
+                        if stage == "Company Search":
+                            failure_status = "Company Search Failed"
+                        elif stage == "Contact Search":
+                            failure_status = "Contact Search Failed"
+                        else:
+                            failure_status = "Clay Workbook Delivery Failed"
+                        conn.execute("UPDATE campaigns SET status = ? WHERE id = ?", (failure_status, selected_id))
+                        conn.commit()
+                        log_activity(
+                            f"{stage} failed", selected_id, selected_name, current_mock_user_name, str(exc)[:1000]
+                        )
+                        st.session_state["clay_search_notice"] = {
+                            "state": "failed", "stage": stage, "error": str(exc),
+                        }
                         st.rerun()
             with edit_col:
                 if selected_permission in ("Owner", "Can Edit"):
@@ -2439,22 +2746,47 @@ if active_page == "Campaigns":
                 show_edit_campaign_dialog(selected_id)
 
             if not selected_approved:
-                st.info("Review the campaign filters, then select **Approve Criteria** to unlock the Clay search.")
+                st.info("Review the campaign filters, then select **Approve Criteria** to unlock Build Campaign Data.")
             elif not clay_api_key:
-                st.warning("Clay API key is not configured. Add it in Streamlit Cloud → App settings → Secrets to enable Build Campaign Data.")
+                st.warning("Clay API key is not configured. Add it in Streamlit Cloud → App settings → Secrets.")
+            elif not company_search_criteria_ready:
+                st.warning("Add at least Industry or Company Country as a company search filter. Current CMS is enriched after review in Clay.")
+            elif not destination_ready:
+                st.warning(
+                    "Before building data, add valid HTTPS links for the Clay workbook and its Companies and Contacts webhook tables in Edit Campaign. "
+                    "The workbook and its two webhook tables must already exist in Clay."
+                )
             st.caption(
-                "Build Campaign Data runs a real Clay company search (up to 50 results per run). "
-                "Contact filters such as job titles, department, seniority, and contact country are reserved for the next contact-search step."
+                "Build Campaign Data searches companies, searches people at those companies, and sends both lists to the configured Clay webhook tables. "
+                "Current CMS and email enrichment are intentionally left for the sales team to run in Clay after reviewing the lists."
             )
 
             clay_notice = st.session_state.pop("clay_search_notice", None)
             if clay_notice:
-                if clay_notice.get("success"):
-                    st.success(f"Clay company search completed: {clay_notice['count']} companies returned.")
-                    if clay_notice.get("has_more"):
-                        st.info("Clay has more matching companies available. This test run retrieved the first 50 results only.")
+                if clay_notice.get("state") == "ready":
+                    st.success(
+                        f"Database ready for review: {clay_notice['company_count']} companies and "
+                        f"{clay_notice['contact_count']} contacts were sent to Clay."
+                    )
+                    st.link_button("Open Clay Workbook", clay_notice["workbook_url"])
+                    if clay_notice.get("company_has_more") or clay_notice.get("contact_has_more"):
+                        st.warning("Clay had more matching results available than the configured 200-record cap for one entity. Review the search counts before expanding the list.")
+                    if clay_notice.get("validation_note"):
+                        st.info(clay_notice["validation_note"])
+                    if clay_notice.get("unverified_employer_count", 0):
+                        st.warning(
+                            f"{clay_notice['unverified_employer_count']} contacts did not include a company identifier in the returned profile. "
+                            "The underlying search was scoped to the target companies; spot-check these rows in Clay."
+                        )
+                elif clay_notice.get("state") == "no_companies":
+                    st.warning("Clay company search completed successfully but returned zero matching companies. Contact search was not run.")
+                    if clay_notice.get("validation_note"):
+                        st.info(clay_notice["validation_note"])
                 else:
-                    st.error(f"Clay search failed: {clay_notice.get('error', 'Unknown error')}")
+                    st.error(
+                        f"{clay_notice.get('stage', 'Clay workflow')} failed. "
+                        f"Campaign status was updated and the error was logged: {clay_notice.get('error', 'Unknown error')}"
+                    )
 
             detail_cols = st.columns([1.25, 2.75])
             with detail_cols[0]:
@@ -2464,9 +2796,9 @@ if active_page == "Campaigns":
                     st.write("**Status**", str(selected_row["status"] or "Draft"))
                     clay_link = str(selected_row.get("clay_table_url", "") or "").strip()
                     if clay_link:
-                        st.link_button("Open Clay Table", clay_link, use_container_width=True)
+                        st.link_button("Open Clay Workbook", clay_link, use_container_width=True)
                     else:
-                        st.caption("List Link (Clay Table): Not added yet")
+                        st.caption("Clay Workbook: Not added yet")
             with detail_cols[1]:
                 with st.container(border=True):
                     st.markdown("**Campaign Criteria (Filters)**")
@@ -2477,11 +2809,12 @@ if active_page == "Campaigns":
                     criteria_cols = st.columns(3)
                     criteria_cols[0].write(f"**Job Titles**\n\n{selected_row['target_titles'] or 'Any'}")
                     criteria_cols[1].write(f"**Department**\n\n{selected_row['department'] or 'Any'}")
-                    criteria_cols[2].write(f"**Current CMS**\n\n{selected_row['current_cms'] or 'Any'}")
+                    criteria_cols[2].write(f"**Current CMS enrichment target**\n\n{selected_row['current_cms'] or 'Not specified'}")
                     criteria_cols = st.columns(3)
                     criteria_cols[0].write(f"**Seniority**\n\n{selected_row['seniority'] or 'Any'}")
                     criteria_cols[1].write(f"**Job Level**\n\n{selected_row['job_level'] or 'Any'}")
-                    criteria_cols[2].write(f"**Minimum ICP Score**\n\n{int(selected_row['min_score'])}/100")
+                    criteria_cols[2].write(f"**Minimum ICP Score (review target)**\n\n{int(selected_row['min_score'])}/100")
+                    st.caption("Current CMS is not applied during sourcing. The sales team will run the website technology/CMS enrichment in Clay after reviewing the company list. Minimum ICP Score is a review target, not a Clay Search API filter in this phase.")
                     with st.expander("Email Sequence Instructions"):
                         st.write(
                             selected_row.get("email_sequence_instructions", "")
@@ -2565,15 +2898,10 @@ if active_page == "Campaigns":
                                     "Raw profiles received from Clay": contact_debug.get("raw_profile_count", 0),
                                     "Profiles with a parsed job title": contact_debug.get("profiles_with_parsed_title_count", 0),
                                     "Profiles with a detected current role": contact_debug.get("profiles_with_current_experience_count", 0),
-                                    "Rejected by local title check": contact_debug.get("title_filter_rejected_count", 0),
+                                    "Title matching": contact_debug.get("title_filtering", "Applied by Clay Search API"),
                                     "Rejected for conflicting employer": contact_debug.get("employer_mismatch_rejected_count", 0),
                                 })
-                                st.caption("Sample rejected title fields (names, emails and phone numbers are not included):")
-                                rejected_samples = contact_debug.get("rejected_title_samples", [])
-                                if rejected_samples:
-                                    st.dataframe(pd.DataFrame(rejected_samples), use_container_width=True, hide_index=True)
-                                else:
-                                    st.caption("No profiles were rejected by the local title check.")
+                                st.caption("Job-title matching is applied by Clay's Search API using its smart matching mode where available.")
                 else:
                     st.error(f"Latest Clay contact search failed: {latest_people_run['error_message']}")
                     with st.expander("Clay contact search query sent"):
@@ -2599,7 +2927,9 @@ if active_page == "Campaigns":
                 )
                 conn.execute("DELETE FROM leads WHERE campaign_id = ?", (selected_id,))
                 conn.execute("DELETE FROM clay_company_results WHERE campaign_id = ?", (selected_id,))
+                conn.execute("DELETE FROM clay_people_results WHERE campaign_id = ?", (selected_id,))
                 conn.execute("DELETE FROM clay_search_runs WHERE campaign_id = ?", (selected_id,))
+                conn.execute("DELETE FROM clay_people_search_runs WHERE campaign_id = ?", (selected_id,))
                 conn.execute("DELETE FROM campaigns WHERE id = ?", (selected_id,))
                 conn.commit()
                 st.session_state.pop("pending_campaign_action", None)
@@ -3048,14 +3378,14 @@ elif active_page == "Settings":
         "Configured" if invitation_email_is_configured() else "Not Configured",
     )
     st.markdown("#### Connect Clay")
-    st.write("The Build Campaign Data action uses Clay's Public Search API to search company records and return the first 50 matches to this dashboard.")
+    st.write("Build Campaign Data uses Clay's Public Search API to find companies and people, then sends the resulting rows to pre-created Clay webhook tables in the campaign's workbook.")
     st.write("To connect it, create a Clay API key in your Clay workspace under API and CLI → API keys, then add it to Streamlit Cloud → App settings → Secrets:")
     st.code('[clay]\napi_key = "PASTE_YOUR_CLAY_API_KEY_HERE"', language="toml")
     st.caption("Keep the key in Streamlit Secrets. Do not paste it into the dashboard, GitHub source code, or this chat.")
     st.markdown("#### Integration scope")
-    st.write("- Build Campaign Data performs a real Clay company search; it does not generate fictional company records.")
-    st.write("- Industry, company country, and current CMS are used for company search. Job titles, department, seniority, and contact country are reserved for the contact-search step.")
-    st.write("- The search API returns records to this dashboard. It does not create or write a Clay workbook/table.")
-    st.write("- This first test does not enrich contacts, consume enrichment credits, create email drafts from live data, or launch campaigns.")
-    st.write("- Search results and campaign data are stored in the app's SQLite database.")
+    st.write("- Company search applies Industry and Company Country. Contact search is scoped to the discovered companies and applies Job Titles, Department, Seniority/Job Level, and Contact Country.")
+    st.write("- Current CMS, work email, phone, and other enrichment are intentionally left for sales to run manually in Clay after list review.")
+    st.write("- The workbook and its Companies/Contacts webhook tables must be created in Clay first. Add the workbook URL and both webhook URLs to the campaign.")
+    st.write("- Search results are also retained in the dashboard's SQLite database for run history and diagnostics.")
+    st.write("- The search collector retrieves up to 200 companies and 200 contacts per execution, across pages; it reports when Clay indicates more results are available.")
     st.write("- Email drafts are not sent. Team invitations can be emailed when SMTP is configured in Streamlit Secrets.")
