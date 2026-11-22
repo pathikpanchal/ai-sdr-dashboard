@@ -126,6 +126,9 @@ st.markdown(
         font-weight: 600 !important;
     }
 
+    /* Team & Access compact sharing layout */
+    div[data-testid="stVerticalBlockBorderWrapper"] {border-radius: 12px;}
+    div.st-key-share_dashboard_form button[kind="primaryFormSubmit"] {min-height: 2.45rem;}
     [data-testid="stMetricValue"] {font-size: 1.8rem;}
     [data-testid="stMetricLabel"] {font-size: 0.95rem;}
     div[data-testid="stMarkdownContainer"] p {font-size: 1rem; line-height: 1.45;}
@@ -1923,6 +1926,165 @@ def log_activity(action, campaign_id=None, campaign_name="", actor="Unassigned",
     conn.commit()
 
 
+
+def get_invitation_email_config():
+    """Read invitation SMTP settings from Streamlit Secrets."""
+    try:
+        config = dict(st.secrets.get("email", {}))
+    except Exception:
+        config = {}
+    try:
+        smtp_port = int(config.get("smtp_port", 587))
+    except (TypeError, ValueError):
+        smtp_port = 587
+    return {
+        "smtp_server": str(config.get("smtp_server", "smtp.gmail.com")).strip(),
+        "smtp_port": smtp_port,
+        "sender_email": str(config.get("sender_email", "")).strip(),
+        "app_password": str(config.get("app_password", "")).replace(" ", "").strip(),
+        "sender_name": str(config.get("sender_name", "AI SDR Dashboard")).strip(),
+        "dashboard_url": str(config.get("dashboard_url", "")).strip().rstrip("/"),
+    }
+
+
+def invitation_email_is_configured():
+    config = get_invitation_email_config()
+    return bool(config["sender_email"] and config["app_password"] and config["dashboard_url"])
+
+
+def send_workspace_invitation_email(recipient_name, recipient_email, permission, inviter_name, invitation_token):
+    """Send a workspace invitation email; credentials are read only from Streamlit Secrets."""
+    config = get_invitation_email_config()
+    if not (config["sender_email"] and config["app_password"] and config["dashboard_url"]):
+        raise ValueError(
+            "Invitation email is not configured. Add sender_email, app_password, and dashboard_url under [email] in Streamlit Secrets."
+        )
+
+    invitation_url = f"{config['dashboard_url']}?invite={invitation_token}"
+    safe_name = html.escape(recipient_name or "there")
+    safe_permission = html.escape(permission)
+    safe_inviter = html.escape(inviter_name or "Workspace Admin")
+    safe_url = html.escape(invitation_url, quote=True)
+
+    message = EmailMessage()
+    message["Subject"] = "You're invited to the AI SDR Dashboard"
+    message["From"] = formataddr((config["sender_name"], config["sender_email"]))
+    message["To"] = recipient_email
+    message.set_content(
+        f"Hi {recipient_name or 'there'},\n\n"
+        f"{inviter_name or 'Workspace Admin'} has invited you to the AI SDR Dashboard.\n\n"
+        f"Dashboard access: {permission}\n\n"
+        f"Accept your invitation using this link:\n{invitation_url}\n\n"
+        "This invitation link expires in 7 days. If you were not expecting this invitation, you can ignore this email."
+    )
+    message.add_alternative(
+        '<html><body style="font-family:Arial,sans-serif;color:#202938;line-height:1.55">'
+        f'<p>Hi {safe_name},</p>'
+        f'<p><strong>{safe_inviter}</strong> has invited you to the AI SDR Dashboard.</p>'
+        f'<p><strong>Dashboard access:</strong> {safe_permission}</p>'
+        f'<p><a href="{safe_url}" style="display:inline-block;background:#5b35d5;color:#fff;'
+        'padding:11px 18px;text-decoration:none;border-radius:6px">Accept Invitation</a></p>'
+        '<p>This invitation link expires in 7 days.</p>'
+        '<p>If you were not expecting this invitation, you can ignore this email.</p>'
+        '</body></html>',
+        subtype="html",
+    )
+
+    with smtplib.SMTP(config["smtp_server"], config["smtp_port"], timeout=25) as server:
+        server.ehlo()
+        server.starttls(context=ssl.create_default_context())
+        server.ehlo()
+        server.login(config["sender_email"], config["app_password"])
+        server.send_message(message)
+
+
+def render_invitation_acceptance():
+    """Accept an emailed workspace invitation in the current Mock Mode workflow."""
+    try:
+        invitation_token = st.query_params.get("invite")
+    except Exception:
+        invitation_token = None
+    if not invitation_token:
+        return
+
+    invitation = conn.execute(
+        """SELECT id, member_email, member_name, permission, invitation_status, invited_by, expires_at
+           FROM workspace_access WHERE invitation_token = ?""",
+        (str(invitation_token),),
+    ).fetchone()
+
+    st.divider()
+    with st.container(border=True):
+        st.subheader("Dashboard invitation")
+        if not invitation:
+            st.error("This invitation link is invalid, expired, or has already been revoked.")
+            return
+        access_id, member_email, member_name, permission, invitation_status, invited_by, expires_at = invitation
+        if invitation_status == "Accepted":
+            st.success("This invitation has already been accepted.")
+            return
+        if invitation_status != "Pending":
+            st.warning("This invitation is no longer active. Ask the dashboard owner to share access again.")
+            return
+        try:
+            is_expired = bool(expires_at) and datetime.fromisoformat(expires_at) < datetime.now()
+        except (TypeError, ValueError):
+            is_expired = False
+        if is_expired:
+            conn.execute(
+                "UPDATE workspace_access SET invitation_status = 'Expired', invitation_token = NULL WHERE id = ?",
+                (access_id,),
+            )
+            conn.commit()
+            st.error("This invitation has expired. Ask the dashboard owner to share access again.")
+            return
+
+        access_label = "View" if permission == "View Only" else "Edit"
+        st.write(f"**Email:** {member_email}")
+        st.write(f"**Dashboard access:** {access_label}")
+        st.write(f"**Shared by:** {invited_by}")
+        st.warning(
+            "This dashboard is currently in Mock Mode. Accepting activates a simulated dashboard identity; "
+            "it does not authenticate the person's email address or provide production-grade access security."
+        )
+        if st.button("Accept Invitation", type="primary", key="accept_workspace_invitation"):
+            now_text = datetime.now().isoformat(timespec="seconds")
+            conn.execute(
+                """INSERT INTO team_members (email, name, status, created_at)
+                   VALUES (?, ?, 'Active', ?)
+                   ON CONFLICT(email) DO UPDATE SET name = excluded.name, status = 'Active'""",
+                (member_email, member_name, now_text),
+            )
+            conn.execute(
+                "UPDATE workspace_access SET invitation_status = 'Accepted', accepted_at = ? WHERE id = ?",
+                (now_text, access_id),
+            )
+            conn.commit()
+            log_activity(
+                "Workspace invitation accepted", None, "Workspace", member_name,
+                f"{member_email} accepted {access_label} access to the dashboard.",
+            )
+            st.session_state["pending_mock_user_email"] = member_email
+            try:
+                del st.query_params["invite"]
+            except Exception:
+                pass
+            st.success("Invitation accepted. The dashboard will open in the invited user's test identity.")
+            st.rerun()
+
+
+def access_label_to_permission(label):
+    """Map the compact UI labels to the existing permission values used by access checks."""
+    return {"View": "View Only", "Edit": "Can Edit"}[label]
+
+
+def permission_to_access_label(permission):
+    return "Edit" if permission == "Can Edit" else "View"
+
+
+render_invitation_acceptance()
+
+
 def next_duplicate_campaign_name(original_name):
     """Return a unique copy name: Name (Copy), Name (Copy 2), etc."""
     existing_names = {
@@ -3033,241 +3195,233 @@ elif active_page == "Review & Approvals":
 
 elif active_page == "Team & Access":
     st.subheader("Team & Access")
-    st.caption("Manage workspace members. Each permission applies to every campaign in the dashboard.")
-
-    if invitation_email_is_configured():
-        st.success("Invitation email is configured. Invitations will be sent as real emails.")
-    else:
-        st.warning("Gmail is not configured yet. Add the email settings in Streamlit Secrets before sending invitations.")
-
-    with st.expander("Gmail setup for testing", expanded=not invitation_email_is_configured()):
-        st.write(
-            "Use a Gmail account with 2-Step Verification enabled and a Google App Password. "
-            "Do not use your normal Gmail password."
-        )
-        st.code(
-            "[email]\nsmtp_server = \"smtp.gmail.com\"\nsmtp_port = 587\n"
-            "sender_email = \"your.test.account@gmail.com\"\n"
-            "app_password = \"your-16-character-google-app-password\"\n"
-            "sender_name = \"AI SDR Dashboard\"\n"
-            "dashboard_url = \"https://your-app-name.streamlit.app\"",
-            language="toml",
-        )
-        st.caption(
-            "Add this under your Streamlit app's Settings → Secrets. Keep the app password private "
-            "and never commit it to GitHub."
-        )
-        st.markdown("[Google instructions: create an App Password](https://support.google.com/mail/answer/185833)")
+    st.caption("Share the AI SDR dashboard with your team and manage their access.")
 
     if is_mock_admin:
-        st.markdown("### Invite a teammate")
-        st.caption("The selected permission will apply to all current and future campaigns.")
-        with st.form("send_workspace_invitation_form"):
-            invite_name = st.text_input("User name")
-            invite_email = st.text_input("User email address")
-            invite_permission = st.selectbox(
-                "Access permission",
-                ["View Only", "Can Edit"],
-                index=None,
-                placeholder="Select permission",
-                help="You must choose a permission. Nothing is selected by default.",
-            )
-            send_invitation = st.form_submit_button("Send Invitation", type="primary")
-
-        if send_invitation:
-            email_value = invite_email.strip().lower()
-            if not invite_name.strip():
-                st.error("Please enter the user's name.")
-            elif not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email_value):
-                st.error("Please enter a valid email address.")
-            elif not invite_permission:
-                st.error("Please select View Only or Can Edit.")
-            elif not invitation_email_is_configured():
-                st.error("Configure Gmail in Streamlit Secrets before sending invitations.")
-            else:
-                invitation_token = pysecrets.token_urlsafe(32)
-                now = datetime.now()
-                now_text = now.isoformat(timespec="seconds")
-                expiry_text = (now + timedelta(days=7)).isoformat(timespec="seconds")
-                inviter_name = current_mock_user_name
-
-                conn.execute(
-                    """
-                    INSERT INTO team_members (email, name, status, created_at)
-                    VALUES (?, ?, 'Pending', ?)
-                    ON CONFLICT(email) DO UPDATE SET name = excluded.name, status = 'Pending'
-                    """,
-                    (email_value, invite_name.strip(), now_text),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO workspace_access
-                    (id, member_email, member_name, permission, invitation_token,
-                     invitation_status, invited_by, invited_at, expires_at, accepted_at, revoked_at)
-                    VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?, ?, NULL, NULL)
-                    ON CONFLICT(member_email) DO UPDATE SET
-                        member_name = excluded.member_name,
-                        permission = excluded.permission,
-                        invitation_token = excluded.invitation_token,
-                        invitation_status = 'Pending',
-                        invited_by = excluded.invited_by,
-                        invited_at = excluded.invited_at,
-                        expires_at = excluded.expires_at,
-                        accepted_at = NULL,
-                        revoked_at = NULL
-                    """,
-                    (
-                        str(uuid.uuid4()), email_value, invite_name.strip(), invite_permission,
-                        invitation_token, inviter_name, now_text, expiry_text,
-                    ),
-                )
-                conn.commit()
-                try:
-                    send_workspace_invitation_email(
-                        invite_name.strip(), email_value, invite_permission, inviter_name, invitation_token
+        with st.container(border=True):
+            st.markdown("### Share Dashboard")
+            st.caption("Invite a team member to access the dashboard. The permission applies to all campaigns.")
+            with st.form("share_dashboard_form", enter_to_submit=False):
+                share_cols = st.columns([2.4, 1.8, 0.72], gap="medium")
+                with share_cols[0]:
+                    share_email = st.text_input(
+                        "Email ID *", placeholder="e.g., john@company.com", label_visibility="visible"
                     )
-                    log_activity(
-                        "Workspace invitation sent",
-                        None,
-                        "Workspace",
-                        inviter_name,
-                        f"Invitation sent to {email_value} with {invite_permission} access to all campaigns.",
+                with share_cols[1]:
+                    share_access = st.selectbox(
+                        "Dashboard access *", ["View", "Edit"], index=None,
+                        placeholder="Select access", label_visibility="visible",
+                        help="View can access campaigns and results. Edit can also change campaign details and approve records.",
                     )
-                    st.success(f"Workspace invitation email sent to {email_value}.")
-                except Exception as exc:
-                    conn.execute(
-                        "UPDATE workspace_access SET invitation_status = 'Email Failed', invitation_token = NULL WHERE member_email = ?",
+                with share_cols[2]:
+                    st.markdown("<div style='height: 1.82rem'></div>", unsafe_allow_html=True)
+                    share_submit = st.form_submit_button("Share", type="primary", use_container_width=True)
+
+            if share_submit:
+                email_value = str(share_email or "").strip().lower()
+                if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email_value):
+                    st.error("Enter a valid email address.")
+                elif not share_access:
+                    st.error("Select View or Edit access.")
+                elif not invitation_email_is_configured():
+                    st.error(
+                        "Invitation email is not configured. Add the SMTP settings shown below to Streamlit Secrets before sharing."
+                    )
+                else:
+                    existing = conn.execute(
+                        "SELECT invitation_status FROM workspace_access WHERE member_email = ?",
                         (email_value,),
-                    )
-                    conn.execute(
-                        "UPDATE team_members SET status = 'Inactive' WHERE email = ?",
-                        (email_value,),
-                    )
-                    conn.commit()
-                    st.error(f"Could not send the invitation email: {exc}")
-
-        st.markdown("### Manage Workspace Access")
-        st.caption("Each person appears once. Their permission applies across the entire workspace.")
-        access_rows = conn.execute(
-            """
-            SELECT id, member_name, member_email, permission, invitation_status,
-                   invited_at, accepted_at
-            FROM workspace_access
-            ORDER BY invited_at DESC
-            """
-        ).fetchall()
-
-        if not access_rows:
-            st.info("No teammates have been invited yet.")
-        else:
-            for access_row in access_rows:
-                (
-                    access_id, member_name, member_email, current_permission,
-                    invitation_status, invited_at, accepted_at,
-                ) = access_row
-                with st.container(border=True):
-                    member_cols = st.columns([1.5, 2.1, 1.25, 1.4, 1.0])
-                    member_cols[0].write(f"**{member_name}**")
-                    member_cols[1].write(member_email)
-                    member_cols[2].write(invitation_status)
-                    with member_cols[3]:
-                        new_permission = st.selectbox(
-                            "Permission",
-                            ["View Only", "Can Edit"],
-                            index=["View Only", "Can Edit"].index(current_permission),
-                            key=f"workspace_permission_{access_id}",
-                            label_visibility="collapsed",
+                    ).fetchone()
+                    if existing and existing[0] == "Accepted":
+                        st.warning("This email already has dashboard access. Change its access level in Shared Users below.")
+                    else:
+                        permission_value = access_label_to_permission(share_access)
+                        # The design asks only for Email ID and Dashboard access. A display name is
+                        # inferred from the email prefix for the existing invitation schema/email greeting.
+                        inferred_name = email_value.split("@", 1)[0].replace(".", " ").replace("_", " ").replace("-", " ").title()
+                        invitation_token = pysecrets.token_urlsafe(32)
+                        now = datetime.now()
+                        now_text = now.isoformat(timespec="seconds")
+                        expiry_text = (now + timedelta(days=7)).isoformat(timespec="seconds")
+                        inviter_name = current_mock_user_name
+                        conn.execute(
+                            """INSERT INTO team_members (email, name, status, created_at)
+                               VALUES (?, ?, 'Pending', ?)
+                               ON CONFLICT(email) DO UPDATE SET name = excluded.name, status = 'Pending'""",
+                            (email_value, inferred_name, now_text),
                         )
-                    with member_cols[4]:
-                        if st.button("Save", key=f"save_workspace_access_{access_id}"):
+                        conn.execute(
+                            """INSERT INTO workspace_access
+                               (id, member_email, member_name, permission, invitation_token,
+                                invitation_status, invited_by, invited_at, expires_at, accepted_at, revoked_at)
+                               VALUES (?, ?, ?, ?, ?, 'Pending', ?, ?, ?, NULL, NULL)
+                               ON CONFLICT(member_email) DO UPDATE SET
+                                   member_name = excluded.member_name,
+                                   permission = excluded.permission,
+                                   invitation_token = excluded.invitation_token,
+                                   invitation_status = 'Pending',
+                                   invited_by = excluded.invited_by,
+                                   invited_at = excluded.invited_at,
+                                   expires_at = excluded.expires_at,
+                                   accepted_at = NULL,
+                                   revoked_at = NULL""",
+                            (
+                                str(uuid.uuid4()), email_value, inferred_name, permission_value,
+                                invitation_token, inviter_name, now_text, expiry_text,
+                            ),
+                        )
+                        conn.commit()
+                        try:
+                            send_workspace_invitation_email(
+                                inferred_name, email_value, permission_value, inviter_name, invitation_token
+                            )
+                            log_activity(
+                                "Dashboard access shared", None, "Workspace", inviter_name,
+                                f"Shared dashboard with {email_value} using {share_access} access.",
+                            )
+                            st.success(f"Invitation sent to {email_value} with {share_access} access.")
+                        except Exception as exc:
                             conn.execute(
-                                "UPDATE workspace_access SET permission = ? WHERE id = ?",
-                                (new_permission, access_id),
+                                "UPDATE workspace_access SET invitation_status = 'Email Failed', invitation_token = NULL WHERE member_email = ?",
+                                (email_value,),
+                            )
+                            conn.execute(
+                                "UPDATE team_members SET status = 'Inactive' WHERE email = ?", (email_value,)
                             )
                             conn.commit()
-                            if invitation_status == "Pending":
-                                latest = conn.execute(
-                                    """
-                                    SELECT invitation_token, member_name, member_email, invited_by
-                                    FROM workspace_access WHERE id = ?
-                                    """,
-                                    (access_id,),
-                                ).fetchone()
-                                try:
-                                    send_workspace_invitation_email(
-                                        latest[1], latest[2], new_permission, latest[3], latest[0]
-                                    )
-                                    st.success("Permission updated and revised invitation email sent.")
-                                except Exception as exc:
-                                    st.error(f"Permission updated, but revised email could not be sent: {exc}")
-                            else:
-                                st.success("Workspace permission updated for all campaigns.")
-                            st.rerun()
+                            st.error(f"The invitation could not be emailed: {exc}")
 
-                    revoke_col, info_col = st.columns([1, 4])
-                    with revoke_col:
-                        if invitation_status != "Revoked":
-                            if st.button("Revoke Access", key=f"revoke_workspace_access_{access_id}"):
+        if not invitation_email_is_configured():
+            with st.expander("Email delivery setup", expanded=False):
+                st.write("Configure SMTP once to send dashboard invitations by email.")
+                st.code(
+                    '[email]\nsmtp_server = "smtp.gmail.com"\nsmtp_port = 587\n'
+                    'sender_email = "your.account@gmail.com"\n'
+                    'app_password = "your-google-app-password"\n'
+                    'sender_name = "AI SDR Dashboard"\n'
+                    'dashboard_url = "https://your-app-name.streamlit.app"',
+                    language="toml",
+                )
+                st.caption("Use a Google App Password, not your normal Gmail password. Keep these values in Streamlit Secrets.")
+                st.markdown("[Google instructions: create an App Password](https://support.google.com/mail/answer/185833)")
+
+        st.markdown("### Shared Users")
+        st.caption("People who can access the dashboard and their assigned access levels.")
+        search_shared_users = st.text_input(
+            "Search by email", placeholder="Search by email...", label_visibility="collapsed",
+            key="shared_users_search",
+        )
+        access_rows = conn.execute(
+            """SELECT id, member_name, member_email, permission, invitation_status, invited_at, invited_by
+               FROM workspace_access ORDER BY invited_at DESC"""
+        ).fetchall()
+        if search_shared_users:
+            needle = search_shared_users.strip().casefold()
+            access_rows = [row for row in access_rows if needle in str(row[2]).casefold()]
+
+        header_cols = st.columns([2.7, 1.15, 1.1, 1.2, 1.15], gap="small")
+        header_cols[0].markdown("**Email ID**")
+        header_cols[1].markdown("**Dashboard access**")
+        header_cols[2].markdown("**Status**")
+        header_cols[3].markdown("**Shared on**")
+        header_cols[4].markdown("**Actions**")
+        st.divider()
+
+        if not access_rows:
+            st.info("No one has been invited yet. Share the dashboard using the form above.")
+        else:
+            for access_row in access_rows:
+                access_id, member_name, member_email, current_permission, invitation_status, invited_at, invited_by = access_row
+                row_cols = st.columns([2.7, 1.15, 1.1, 1.2, 1.15], gap="small")
+                row_cols[0].write(member_email)
+                with row_cols[1]:
+                    current_label = permission_to_access_label(current_permission)
+                    new_access_label = st.selectbox(
+                        "Dashboard access", ["View", "Edit"],
+                        index=["View", "Edit"].index(current_label),
+                        key=f"workspace_access_select_{access_id}",
+                        label_visibility="collapsed",
+                    )
+                row_cols[2].write(invitation_status)
+                row_cols[3].write(format_created_date(invited_at))
+                action_cols = row_cols[4].columns(2, gap="small")
+                if action_cols[0].button("Save", key=f"save_shared_user_{access_id}", help="Save access level"):
+                    permission_value = access_label_to_permission(new_access_label)
+                    if invitation_status == "Revoked":
+                        st.error("This access has been revoked. Share the dashboard again to re-invite this person.")
+                    elif invitation_status in ("Pending", "Email Failed", "Expired"):
+                        # Re-issue a fresh invitation when changing permission for a pending user.
+                        if not invitation_email_is_configured():
+                            st.error("Configure invitation email before updating a pending invitation.")
+                        else:
+                            new_token = pysecrets.token_urlsafe(32)
+                            now = datetime.now()
+                            now_text = now.isoformat(timespec="seconds")
+                            expiry_text = (now + timedelta(days=7)).isoformat(timespec="seconds")
+                            conn.execute(
+                                "UPDATE workspace_access SET permission = ?, invitation_token = ?, invitation_status = 'Pending', invited_at = ?, expires_at = ?, accepted_at = NULL WHERE id = ?",
+                                (permission_value, new_token, now_text, expiry_text, access_id),
+                            )
+                            conn.commit()
+                            try:
+                                send_workspace_invitation_email(member_name, member_email, permission_value, invited_by, new_token)
+                                st.success(f"Access updated and a new invitation sent to {member_email}.")
+                            except Exception as exc:
                                 conn.execute(
-                                    """
-                                    UPDATE workspace_access
-                                    SET invitation_status = 'Revoked',
-                                        invitation_token = NULL,
-                                        revoked_at = ?
-                                    WHERE id = ?
-                                    """,
-                                    (datetime.now().isoformat(timespec="seconds"), access_id),
-                                )
-                                conn.execute(
-                                    "UPDATE team_members SET status = 'Inactive' WHERE email = ?",
-                                    (member_email,),
+                                    "UPDATE workspace_access SET invitation_status = 'Email Failed', invitation_token = NULL WHERE id = ?",
+                                    (access_id,),
                                 )
                                 conn.commit()
-                                log_activity(
-                                    "Workspace access revoked",
-                                    None,
-                                    "Workspace",
-                                    current_mock_user_name,
-                                    f"Revoked all-campaign access for {member_email}.",
-                                )
-                                st.success(f"Workspace access revoked for {member_email}.")
-                                st.rerun()
-                    with info_col:
-                        st.caption(
-                            f"Invited: {format_created_date(invited_at)}"
-                            + (f" · Accepted: {format_created_date(accepted_at)}" if accepted_at else "")
+                                st.error(f"Access was saved, but the updated invitation could not be emailed: {exc}")
+                    else:
+                        conn.execute(
+                            "UPDATE workspace_access SET permission = ? WHERE id = ?",
+                            (permission_value, access_id),
                         )
+                        conn.commit()
+                        log_activity(
+                            "Dashboard access updated", None, "Workspace", current_mock_user_name,
+                            f"Changed {member_email} access to {new_access_label}.",
+                        )
+                        st.success(f"Dashboard access updated for {member_email}.")
+                    st.rerun()
 
+                if action_cols[1].button("Remove", key=f"remove_shared_user_{access_id}", help="Revoke dashboard access"):
+                    conn.execute(
+                        """UPDATE workspace_access SET invitation_status = 'Revoked', invitation_token = NULL,
+                           revoked_at = ? WHERE id = ?""",
+                        (datetime.now().isoformat(timespec="seconds"), access_id),
+                    )
+                    conn.execute("UPDATE team_members SET status = 'Inactive' WHERE email = ?", (member_email,))
+                    conn.commit()
+                    log_activity(
+                        "Dashboard access revoked", None, "Workspace", current_mock_user_name,
+                        f"Revoked dashboard access for {member_email}.",
+                    )
+                    st.success(f"Dashboard access removed for {member_email}.")
+                    st.rerun()
+
+                st.caption(f"Shared by {invited_by}")
     else:
         current_access = conn.execute(
-            """
-            SELECT permission, invitation_status, invited_by, invited_at, accepted_at
-            FROM workspace_access WHERE member_email = ?
-            """,
+            """SELECT permission, invitation_status, invited_by, invited_at, accepted_at
+               FROM workspace_access WHERE member_email = ?""",
             (current_mock_user_email,),
         ).fetchone()
-        st.markdown("### Your Workspace Access")
+        st.markdown("### Your Dashboard Access")
         if current_access:
             permission, invitation_status, invited_by, invited_at, accepted_at = current_access
-            st.write(f"**Workspace:** All campaigns")
-            st.write(f"**Permission:** {permission}")
+            st.write(f"**Dashboard access:** {permission_to_access_label(permission)}")
             st.write(f"**Status:** {invitation_status}")
-            st.caption(f"Invited by {invited_by} on {format_created_date(invited_at)}")
+            st.caption(f"Shared by {invited_by} on {format_created_date(invited_at)}")
         else:
-            st.info("No workspace access has been assigned to this mock user.")
-        st.caption("Only Workspace Admin can invite teammates, change workspace permissions, or revoke access.")
+            st.info("No dashboard access has been assigned to this test identity.")
+        st.caption("Only the dashboard owner can share access or change another user's permission.")
 
-    st.markdown("### Mock Access Testing")
-    st.write(f"**Current mock identity:** {current_mock_user_name}")
-    st.caption(
-        "Use Switch Mock User in the sidebar to preview the dashboard as an accepted invitee. "
-        "View Only users can view all campaigns and drafts; Can Edit users can edit and duplicate all campaigns. "
-        "Only Workspace Admin can delete campaigns."
-    )
     st.warning(
-        "This is a permission simulation for testing, not secure authentication. Anyone who can open "
-        "the public dashboard can change the mock identity selector. Add real login and a shared production "
-        "database before using this for confidential company data."
+        "This dashboard still uses Mock Mode identity selection and a local SQLite database. "
+        "Invitations can be emailed, but this is not production-grade authentication: users can switch the mock identity. "
+        "Use real authentication and a shared database before relying on these permissions for sensitive company data."
     )
 
 elif active_page == "Activity Log":
