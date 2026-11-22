@@ -2388,9 +2388,13 @@ if active_page == "Campaigns":
             selected_owner = str(selected_row.get("campaign_owner", "Unassigned") or "Unassigned")
 
             st.divider()
-            action_title, approve_col, build_col, edit_col, duplicate_col, delete_col = st.columns([2.25, 1.35, 1.55, 1.2, 1.45, 1.1])
-            with action_title:
-                st.markdown(f"#### Selected Campaign: {selected_name}")
+            st.markdown(f"#### Selected Campaign: {selected_name}")
+            # Keep all campaign actions in one dedicated row. The campaign title
+            # sits above the buttons so it cannot squeeze Build Campaign Data
+            # onto a second line on narrower screens.
+            approve_col, build_col, edit_col, duplicate_col, delete_col = st.columns(
+                [1.25, 1.45, 1.0, 1.35, 1.15], gap="small"
+            )
             selected_permission = get_campaign_permission(selected_id)
             selected_approved = bool(int(selected_row.get("criteria_approved", 0) or 0))
             clay_api_key = get_clay_api_key()
@@ -2468,17 +2472,19 @@ if active_page == "Campaigns":
                 or split_clay_values(selected_row.get("company_country", ""))
                 or split_clay_values(selected_row.get("company_size", ""))
             )
+            build_disabled_reason = ""
+            if mapping_needs_review:
+                build_disabled_reason = "Review the suggested Clay industry before approving."
+            elif not selected_approved:
+                build_disabled_reason = "Approve campaign criteria first."
+            elif not clay_api_key:
+                build_disabled_reason = "Clay API key is not configured."
+            elif not company_search_criteria_ready:
+                build_disabled_reason = "Add Industry, Company Country, or Company Size. Current CMS is enriched after review in Clay."
+            elif not destination_ready:
+                build_disabled_reason = "Add a valid Clay workbook link and both webhook URLs in Edit Campaign before building and publishing data."
+
             with build_col:
-                if mapping_needs_review:
-                    st.caption("Review the suggested Clay industry before approving.")
-                if not selected_approved:
-                    st.caption("Approve campaign criteria first.")
-                elif not clay_api_key:
-                    st.caption("Clay API key is not configured.")
-                elif not company_search_criteria_ready:
-                    st.caption("Add Industry, Company Country, or Company Size. Current CMS is enriched after review in Clay.")
-                elif not destination_ready:
-                    st.caption("Clay Details are optional when creating a campaign. Add a valid workbook link and both webhook URLs in Edit Campaign before building and publishing data.")
                 if st.button(
                     "Build Campaign Data",
                     key="build_campaign_data_clay",
@@ -2580,6 +2586,8 @@ if active_page == "Campaigns":
                             "state": "failed", "stage": stage, "error": str(exc),
                         }
                         st.rerun()
+                if build_disabled_reason:
+                    st.caption(build_disabled_reason)
             with edit_col:
                 if selected_permission in ("Owner", "Can Edit"):
                     if st.button("Edit Campaign", key="selected_edit_campaign", use_container_width=True):
