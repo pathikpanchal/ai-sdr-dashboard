@@ -60,7 +60,23 @@ st.markdown(
 
     /* Compact, content-sized Create Campaign action. */
     div[role="dialog"] {
-        max-width: min(720px, 92vw) !important;
+        width: min(1500px, 98vw) !important;
+        max-width: 98vw !important;
+    }
+    div[role="dialog"] [data-testid="stVerticalBlock"] > div {
+        min-width: 0;
+    }
+    div[role="dialog"] [data-testid="stForm"] {
+        width: 100%;
+    }
+    div[role="dialog"] h3 {
+        margin-top: 0.15rem;
+        margin-bottom: 0.55rem;
+    }
+    div[role="dialog"] [data-testid="stVerticalBlockBorderWrapper"] {
+        border-radius: 12px;
+        border-color: #e6e8f0;
+        background: #ffffff;
     }
     div[role="dialog"] [data-testid="stVerticalBlock"] {
         gap: 0.55rem !important;
@@ -109,7 +125,26 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-SENIORITY_OPTIONS = ["Manager", "Head", "Director", "VP", "C-Suite", "Owner / Founder"]
+SENIORITY_OPTIONS = [
+    "Founder", "Owner", "Board Member", "Partner", "C-suite", "VP", "Director",
+    "Head", "Manager", "Senior", "Mid-level", "Entry", "Intern / in-training", "Unknown",
+]
+COMPANY_SIZE_OPTIONS = [
+    "2-10 employees", "11-50 employees", "51-200 employees", "201-500 employees",
+    "501-1,000 employees", "1,001-5,000 employees", "5,001-10,000 employees",
+    "10,001+ employees",
+]
+# Clay's Public API `sizes` filter takes bucket boundary codes, not the UI labels.
+COMPANY_SIZE_CLAY_VALUES = {
+    "2-10 employees": "2",
+    "11-50 employees": "10",
+    "51-200 employees": "50",
+    "201-500 employees": "200",
+    "501-1,000 employees": "500",
+    "1,001-5,000 employees": "1000",
+    "5,001-10,000 employees": "5000",
+    "10,001+ employees": "10000",
+}
 JOB_LEVEL_OPTIONS = ["Above", "Any", "Below", "Exact"]
 
 # This ordering is used only to interpret Above / Below in this MVP.
@@ -326,6 +361,7 @@ def get_connection():
     migrations = {
         "campaigns": {
             "current_cms": "TEXT DEFAULT ''",
+            "company_size": "TEXT DEFAULT ''",
             "department": "TEXT DEFAULT ''",
             "seniority": "TEXT DEFAULT 'Manager'",
             "job_level": "TEXT DEFAULT 'Above'",
@@ -636,6 +672,27 @@ def get_clay_api_key():
     return str(secret_value or os.getenv("CLAY_API_KEY", "")).strip()
 
 
+def get_clay_search_result_cap():
+    """Return the per-search result cap configured for this Clay workspace.
+
+    Free and Trial workspaces are limited to 50 results per search. Keep 50 as
+    the safe default; only raise this value after checking the plan for the
+    workspace that owns the API key. This implementation caps one search at 500.
+    """
+    configured = 50
+    try:
+        clay_secrets = st.secrets.get("clay", {})
+        if hasattr(clay_secrets, "get"):
+            configured = clay_secrets.get("max_results_per_search", 50)
+    except Exception:
+        configured = 50
+    try:
+        configured = int(configured)
+    except (TypeError, ValueError):
+        configured = 50
+    return max(1, min(configured, 500))
+
+
 def split_clay_values(query):
     """Split comma/semicolon/newline values without changing their original casing."""
     raw = str(query or "").replace(";", ",").replace("\n", ",")
@@ -835,16 +892,27 @@ def _stable_person_key(row):
     ).strip()
 
 
-def collect_clay_search_results(api_key, search_id, entity_type, max_results=200, page_size=20):
-    """Collect search pages, deduplicating each result by its stable Clay identity."""
+def collect_clay_search_results(api_key, search_id, entity_type, max_results=50, page_size=20):
+    """Collect at most Clay's 50-result Free/Trial per-search allowance.
+
+    Track requested capacity separately from unique rows: Clay meters the number
+    of results requested/returned for a search, while local deduplication can
+    reduce the number of rows retained. Never request a page that would take
+    this search beyond 50 results on a Free/Trial workspace.
+    """
     base_url = "https://api.clay.com/public/v0"
     headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
     rows, seen = [], set()
     has_more = False
     page_count = 0
+    requested_total = 0
+    # Safe default is 50. A higher cap is configurable only after the workspace
+    # plan has been checked in Clay. Clay allows at most 500 results per request.
+    search_cap = min(max(1, int(max_results)), 500)
+    page_size = min(max(1, int(page_size)), 500)
 
-    while len(rows) < max_results:
-        page_limit = min(page_size, max_results - len(rows))
+    while requested_total < search_cap:
+        page_limit = min(page_size, search_cap - requested_total)
         response = _clay_api_request(
             "POST",
             f"{base_url}/search/filters-mode/{search_id}/run",
@@ -853,14 +921,26 @@ def collect_clay_search_results(api_key, search_id, entity_type, max_results=200
             timeout=60,
         )
         if not response.ok:
+            error_text = str(getattr(response, "text", "") or "")[:1000]
+            # If Clay unexpectedly refuses a later page at the per-search cap,
+            # preserve already fetched records as a partial result instead of
+            # throwing them away. Other 402 errors (e.g. period quota) remain fatal.
+            if (
+                response.status_code == 402
+                and "single search" in error_text.casefold()
+                and rows
+            ):
+                has_more = True
+                break
             raise RuntimeError(
-                f"Clay {entity_type} results request failed (HTTP {response.status_code}): {response.text[:1000]}"
+                f"Clay {entity_type} results request failed (HTTP {response.status_code}): {error_text}"
             )
         payload = _clay_json(response, f"{entity_type} results")
         page_rows = payload.get("data", [])
         if not isinstance(page_rows, list):
             raise RuntimeError(f"Clay {entity_type} results response did not contain a data list.")
         page_count += 1
+        requested_total += page_limit
         has_more = bool(payload.get("has_more", False))
         new_rows = []
         for row in page_rows:
@@ -880,9 +960,11 @@ def collect_clay_search_results(api_key, search_id, entity_type, max_results=200
         if not page_rows or not new_rows or not has_more:
             break
 
-    if len(rows) >= max_results and has_more:
+    # Reaching the local per-search cap while Clay still has more matches is an
+    # expected partial result, not a failed search.
+    if requested_total >= search_cap and has_more:
         has_more = True
-    return rows[:max_results], has_more, page_count
+    return rows[:search_cap], has_more, page_count
 
 
 def fetch_clay_company_filter_schema(api_key):
@@ -927,6 +1009,19 @@ def run_clay_company_search(campaign, campaign_id, api_key):
         if "location_headquarters_only" in schema:
             filters["location_headquarters_only"] = True
 
+    company_size_labels = split_clay_values(campaign.get("company_size", ""))
+    if company_size_labels:
+        size_field = schema.get("sizes") or schema.get("company_sizes") or schema.get("company_size")
+        if not size_field:
+            raise RuntimeError("Clay's live company-search schema does not expose a company size filter.")
+        unknown_size_labels = [label for label in company_size_labels if label not in COMPANY_SIZE_CLAY_VALUES]
+        if unknown_size_labels:
+            raise ValueError("Unsupported Company Size option(s): " + ", ".join(unknown_size_labels))
+        # Clay's `sizes` API filter expects bucket codes such as 2, 10, 50, 500,
+        # 1000, 5000, and 10000, not the display labels shown in its UI.
+        company_size_codes = [COMPANY_SIZE_CLAY_VALUES[label] for label in company_size_labels]
+        filters["sizes"] = _clay_filter_values(size_field, company_size_codes, "Company Size")
+
     # Current CMS is intentionally not used as a search filter in this phase.
     # The sales team will add Clay's website-technology/CMS enrichment after reviewing the sourced list.
     validation_note = (
@@ -934,7 +1029,7 @@ def run_clay_company_search(campaign, campaign_id, api_key):
         if split_clay_values(campaign.get("current_cms", "")) else ""
     )
     if not filters:
-        raise ValueError("Add at least one company-search filter (Industry or Company Country). Current CMS is enriched later in Clay.")
+        raise ValueError("Add at least one company-search filter (Industry, Company Country, or Company Size). Current CMS is enriched later in Clay.")
 
     headers = {"clay-api-key": api_key, "Content-Type": "application/json"}
     base_url = "https://api.clay.com/public/v0"
@@ -961,7 +1056,7 @@ def run_clay_company_search(campaign, campaign_id, api_key):
             raise RuntimeError("Clay did not return a company search ID.")
 
         rows, has_more, page_count = collect_clay_search_results(
-            api_key, clay_search_id, "company", max_results=200, page_size=20
+            api_key, clay_search_id, "company", max_results=get_clay_search_result_cap(), page_size=20
         )
         conn.execute(
             """INSERT INTO clay_search_runs
@@ -1125,35 +1220,32 @@ def _clay_filter_values(schema_field, values, label):
 
 
 def _expand_seniority_for_job_level(campaign):
-    """Translate the UI's seniority + Above/Below/Exact setting into Clay levels."""
+    """Map dashboard seniority labels to Clay's current seniority enum values."""
     selected_labels = split_clay_values(campaign.get("seniority", ""))
     if not selected_labels:
         return []
 
-    # Ordered from most junior to most senior. Above includes the selected
-    # level(s) and all levels above them; Below includes selected and below.
-    # Clay's documented people seniority vocabulary. For an "Above" selection,
-    # include the selected level and every more-senior level. Partner and
-    # board-member are also above Head in Clay's hierarchy.
-    rank_groups = [
-        (1, ["manager"]),
-        (2, ["head"]),
-        (3, ["director"]),
-        (4, ["vp"]),
-        (5, ["c-suite"]),
-        (6, ["partner"]),
-        (7, ["owner", "founder"]),
-        (8, ["board-member"]),
-    ]
     label_to_values = {
-        "manager": ["manager"],
-        "head": ["head"],
-        "director": ["director"],
-        "vp": ["vp"],
-        "c-suite": ["c-suite"],
-        "owner / founder": ["owner", "founder"],
-        "owner": ["owner"],
         "founder": ["founder"],
+        "owner": ["owner"],
+        "board member": ["board-member"],
+        "board-member": ["board-member"],
+        "partner": ["partner"],
+        "c-suite": ["c-suite"],
+        "vp": ["vp"],
+        "director": ["director"],
+        "head": ["head"],
+        "manager": ["manager"],
+        "senior": ["senior"],
+        "mid-level": ["mid-level"],
+        "mid level": ["mid-level"],
+        "entry": ["entry"],
+        "intern / in-training": ["intern"],
+        "intern/in-training": ["intern"],
+        "intern": ["intern"],
+        "unknown": ["unknown"],
+        # Backward compatibility with campaigns created before the expanded list.
+        "owner / founder": ["owner", "founder"],
     }
 
     selected_values = []
@@ -1165,19 +1257,21 @@ def _expand_seniority_for_job_level(campaign):
         selected_values.extend(mapped)
     selected_values = list(dict.fromkeys(selected_values))
 
-    level = str(campaign.get("job_level", "Any") or "Any").strip().casefold()
-    if level in ("", "any"):
-        return []
-    if level == "exact":
-        return selected_values
+    # Current Create/Edit forms use exact selected levels. Keep the previous
+    # Above/Below behaviour only for legacy campaign records that still carry it.
+    level = str(campaign.get("job_level", "Exact") or "Exact").strip().casefold()
+    if level in ("", "any", "exact"):
+        return [] if level == "any" else selected_values
 
-    selected_ranks = [
-        rank for rank, values in rank_groups
-        if set(values).intersection(selected_values)
+    rank_groups = [
+        (1, ["intern"]), (2, ["entry"]), (3, ["mid-level"]), (4, ["senior"]),
+        (5, ["manager"]), (6, ["head"]), (7, ["director"]), (8, ["vp"]),
+        (9, ["c-suite"]), (10, ["partner"]), (11, ["owner", "founder"]),
+        (12, ["board-member"]), (13, ["unknown"]),
     ]
+    selected_ranks = [rank for rank, values in rank_groups if set(values).intersection(selected_values)]
     if not selected_ranks:
         return selected_values
-
     if level == "above":
         threshold = min(selected_ranks)
         return [value for rank, values in rank_groups if rank >= threshold for value in values]
@@ -1468,7 +1562,7 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
             raise RuntimeError("Clay did not return a contact search ID.")
 
         raw_rows, has_more, page_count = collect_clay_search_results(
-            api_key, clay_search_id, "people", max_results=200, page_size=20
+            api_key, clay_search_id, "people", max_results=get_clay_search_result_cap(), page_size=20
         )
         match_values = company_match_identifiers or company_identifiers
         approved_ids = {
@@ -1831,135 +1925,111 @@ def show_edit_campaign_dialog(campaign_id):
         st.error("This campaign could not be found. Close this window and refresh the dashboard.")
         return
 
-    st.caption("Update the campaign details and targeting criteria. Changes require criteria approval again.")
-
-    saved_seniority = [
-        value.strip()
-        for value in str(campaign.get("seniority", "Manager") or "Manager").split(",")
-        if value.strip() in SENIORITY_OPTIONS
-    ] or ["Manager"]
-
-    current_job_level = str(campaign.get("job_level", "Above") or "Above")
-    if current_job_level not in JOB_LEVEL_OPTIONS:
-        current_job_level = "Above"
+    st.caption("Update campaign details and targeting criteria. Changes to filters require criteria approval again.")
+    seniority_lookup = {value.casefold(): value for value in SENIORITY_OPTIONS}
+    saved_seniority = []
+    for value in split_clay_values(campaign.get("seniority", "")):
+        if value.casefold() == "owner / founder":
+            saved_seniority.extend(["Owner", "Founder"])
+        elif value.casefold() in seniority_lookup:
+            saved_seniority.append(seniority_lookup[value.casefold()])
+    saved_seniority = list(dict.fromkeys(saved_seniority))
+    saved_sizes = [
+        value.strip() for value in str(campaign.get("company_size", "") or "").split(",")
+        if value.strip() in COMPANY_SIZE_OPTIONS
+    ]
 
     with st.form(f"edit_campaign_modal_form_{campaign_id}", enter_to_submit=False):
-        st.markdown("**Campaign details**")
-        name_col, owner_col = st.columns(2)
-        with name_col:
+        meta_cols = st.columns([1.5, 1.2, 2])
+        with meta_cols[0]:
             edit_name = st.text_input("Campaign Name *", value=str(campaign.get("name") or ""))
-        with owner_col:
-            edit_owner = st.text_input(
-                "Campaign Owner",
-                value=str(campaign.get("campaign_owner", "Unassigned") or "Unassigned"),
+        with meta_cols[1]:
+            edit_owner = st.text_input("Campaign Owner", value=str(campaign.get("campaign_owner", "Unassigned") or "Unassigned"))
+        with meta_cols[2]:
+            edit_clay_table_url = st.text_input(
+                "Clay Workbook Link", value=str(campaign.get("clay_table_url", "") or ""),
+                placeholder="https://app.clay.com/...",
+                help="The sales team will open this workbook to review companies and contacts.",
             )
 
         st.divider()
-        st.markdown("**Company criteria**")
-        industry_col, company_country_col = st.columns(2)
-        with industry_col:
-            edit_industry = st.text_input(
-                "Industry",
-                value=str(campaign.get("industry") or ""),
-                help="Enter multiple industries separated by commas, e.g. Pharmaceuticals, Retail.",
-            )
-        with company_country_col:
-            edit_company_country = st.text_input(
-                "Company Country (Headquarters)",
-                value=str(campaign.get("company_country") or ""),
-                help="Use the company's headquarters country, not countries where it has branch offices.",
-            )
-        cms_col, score_col = st.columns(2)
-        with cms_col:
-            edit_current_cms = st.text_input(
-                "Current CMS (enrich in Clay after review)",
-                value=str(campaign.get("current_cms") or ""),
-                help="For this phase, the dashboard does not filter by CMS. Sales will run Clay's website technology/CMS enrichment after reviewing companies.",
-            )
-        with score_col:
+        company_col, contact_col = st.columns(2, gap="large")
+        with company_col:
+            with st.container(border=True):
+                st.markdown("### 🏢 Companies")
+                st.caption("Filter the companies you want to target.")
+                company_row1 = st.columns(2)
+                with company_row1[0]:
+                    edit_industry = st.text_input("Industry", value=str(campaign.get("industry") or ""), placeholder="e.g., Pharmaceuticals, Retail")
+                with company_row1[1]:
+                    edit_company_country = st.text_input("Company Country", value=str(campaign.get("company_country") or ""), placeholder="e.g., United Kingdom")
+                company_row2 = st.columns(2)
+                with company_row2[0]:
+                    edit_company_size = st.multiselect(
+                        "Company Size", COMPANY_SIZE_OPTIONS, default=saved_sizes,
+                        placeholder="Select company size",
+                    )
+                with company_row2[1]:
+                    edit_current_cms = st.text_input(
+                        "Current CMS", value=str(campaign.get("current_cms") or ""),
+                        placeholder="Select or type CMS",
+                        help="Optional research note. Sales will enrich Current CMS in Clay after reviewing the company list.",
+                    )
+
+        with contact_col:
+            with st.container(border=True):
+                st.markdown("### 👥 Contacts")
+                st.caption("Define the right contacts at those companies.")
+                contact_row1 = st.columns(2)
+                with contact_row1[0]:
+                    edit_target_titles = st.text_input(
+                        "Job Title", value=str(campaign.get("target_titles") or ""),
+                        placeholder="e.g., Marketing Director, Head of Growth",
+                        help="Enter multiple job titles separated by commas.",
+                    )
+                with contact_row1[1]:
+                    edit_seniority = st.multiselect(
+                        "Seniority", SENIORITY_OPTIONS, default=saved_seniority,
+                        placeholder="Select seniority levels",
+                    )
+                edit_contact_country = st.text_input(
+                    "Contact Country", value=str(campaign.get("contact_country") or ""),
+                    placeholder="e.g., United Kingdom",
+                    help="Based on the person's location, not the company's headquarters.",
+                )
+                with st.expander("Additional contact filter", expanded=False):
+                    edit_department = st.text_input(
+                        "Department", value=str(campaign.get("department") or ""),
+                        placeholder="e.g., Marketing, Sales",
+                    )
+
+        with st.expander("Campaign details and Clay delivery settings", expanded=False):
             edit_min_score = st.slider(
-                "Minimum ICP score (review target)",
-                min_value=0,
-                max_value=100,
+                "Minimum ICP score (review target)", 0, 100,
                 value=int(campaign.get("min_score", 0) or 0),
             )
+            edit_email_instructions = st.text_area(
+                "Email Sequence Instructions", value=str(campaign.get("email_sequence_instructions", "") or ""), height=90,
+            )
+            edit_companies_webhook = st.text_input(
+                "Companies Table Webhook URL", value=str(campaign.get("clay_companies_webhook_url", "") or ""),
+                placeholder="Paste the webhook URL from the Clay Companies table",
+            )
+            edit_contacts_webhook = st.text_input(
+                "Contacts Table Webhook URL", value=str(campaign.get("clay_contacts_webhook_url", "") or ""),
+                placeholder="Paste the webhook URL from the Clay Contacts table",
+            )
+            st.caption("Optional webhook authentication")
+            auth_cols = st.columns(2)
+            with auth_cols[0]:
+                edit_companies_webhook_auth = st.text_input(
+                    "Companies Webhook Auth Token", value=str(campaign.get("clay_companies_webhook_auth", "") or ""), type="password",
+                )
+            with auth_cols[1]:
+                edit_contacts_webhook_auth = st.text_input(
+                    "Contacts Webhook Auth Token", value=str(campaign.get("clay_contacts_webhook_auth", "") or ""), type="password",
+                )
 
-        st.divider()
-        st.markdown("**Contact criteria**")
-        contact_country_col, department_col = st.columns(2)
-        with contact_country_col:
-            edit_contact_country = st.text_input(
-                "Contact Country (Person Location)",
-                value=str(campaign.get("contact_country") or ""),
-                help="Use the person's profile location, not the employer's headquarters country.",
-            )
-        with department_col:
-            edit_department = st.text_input(
-                "Department",
-                value=str(campaign.get("department") or ""),
-                help="Multiple departments are allowed, e.g. Marketing, Sales.",
-            )
-        edit_target_titles = st.text_input(
-            "Job Titles",
-            value=str(campaign.get("target_titles") or ""),
-            help="Enter several titles separated by commas, e.g. CMO, Marketing Director, Head of Marketing.",
-        )
-        seniority_col, job_level_col = st.columns(2)
-        with seniority_col:
-            edit_seniority = st.multiselect(
-                "Seniority",
-                SENIORITY_OPTIONS,
-                default=saved_seniority,
-                help="Select one or more seniority levels.",
-            )
-        with job_level_col:
-            edit_job_level = st.selectbox(
-                "Job Level",
-                JOB_LEVEL_OPTIONS,
-                index=JOB_LEVEL_OPTIONS.index(current_job_level),
-                help=(
-                    "Above includes the selected level(s) and higher. Below includes "
-                    "the selected level(s) and lower. Exact matches only selected levels."
-                ),
-            )
-
-        st.divider()
-        st.markdown("**Campaign execution details**")
-        edit_email_instructions = st.text_area(
-            "Email Sequence Instructions",
-            value=str(campaign.get("email_sequence_instructions", "") or ""),
-            height=120,
-        )
-        st.markdown("**Clay destination for this campaign**")
-        edit_clay_table_url = st.text_input(
-            "Clay Workbook Link",
-            value=str(campaign.get("clay_table_url", "") or ""),
-            placeholder="Paste the Clay workbook URL",
-            help="The sales team will open this workbook to review the sourced companies and contacts.",
-        )
-        edit_companies_webhook = st.text_input(
-            "Companies Table Webhook URL",
-            value=str(campaign.get("clay_companies_webhook_url", "") or ""),
-            placeholder="Paste the webhook URL from the Clay Companies table",
-            help="Create a Webhooks → Monitor webhook source in the Companies table and paste its HTTPS URL here.",
-        )
-        edit_contacts_webhook = st.text_input(
-            "Contacts Table Webhook URL",
-            value=str(campaign.get("clay_contacts_webhook_url", "") or ""),
-            placeholder="Paste the webhook URL from the Clay Contacts table",
-            help="Create a Webhooks → Monitor webhook source in the Contacts table and paste its HTTPS URL here.",
-        )
-        with st.expander("Optional webhook authentication", expanded=False):
-            edit_companies_webhook_auth = st.text_input(
-                "Companies Webhook Auth Token",
-                value=str(campaign.get("clay_companies_webhook_auth", "") or ""),
-                type="password",
-            )
-            edit_contacts_webhook_auth = st.text_input(
-                "Contacts Webhook Auth Token",
-                value=str(campaign.get("clay_contacts_webhook_auth", "") or ""),
-                type="password",
-            )
         save_changes = st.form_submit_button("Save Changes", type="primary", use_container_width=True)
 
     cancel_col, _ = st.columns([1, 4])
@@ -1972,47 +2042,40 @@ def show_edit_campaign_dialog(campaign_id):
     if save_changes:
         if not edit_name.strip():
             st.error("Please enter a campaign name.")
-        elif not edit_seniority and edit_job_level != "Any":
-            st.error("Select at least one seniority level, or choose Job Level = Any.")
         else:
             owner_value = edit_owner.strip() or "Unassigned"
             original_campaign = campaign_as_dict(campaign_id) or {}
             search_criteria_fields = {
                 "industry": edit_industry.strip(),
                 "company_country": edit_company_country.strip(),
+                "company_size": ", ".join(edit_company_size),
                 "contact_country": edit_contact_country.strip(),
                 "target_titles": edit_target_titles.strip(),
                 "department": edit_department.strip(),
                 "seniority": ", ".join(edit_seniority),
-                "job_level": edit_job_level,
+                "job_level": "Exact",
             }
             criteria_changed = any(
                 str(original_campaign.get(field, "") or "").strip() != str(value or "").strip()
                 for field, value in search_criteria_fields.items()
             )
             conn.execute(
-                """
-                UPDATE campaigns
-                SET name = ?, campaign_owner = ?, industry = ?, company_country = ?,
-                    contact_country = ?, target_titles = ?, min_score = ?, current_cms = ?,
-                    department = ?, seniority = ?, job_level = ?,
-                    email_sequence_instructions = ?, clay_table_url = ?,
-                    clay_companies_webhook_url = ?, clay_contacts_webhook_url = ?,
-                    clay_companies_webhook_auth = ?, clay_contacts_webhook_auth = ?
-                WHERE id = ?
-                """,
+                """UPDATE campaigns
+                   SET name = ?, campaign_owner = ?, industry = ?, company_country = ?, company_size = ?,
+                       contact_country = ?, target_titles = ?, min_score = ?, current_cms = ?,
+                       department = ?, seniority = ?, job_level = ?, email_sequence_instructions = ?,
+                       clay_table_url = ?, clay_companies_webhook_url = ?, clay_contacts_webhook_url = ?,
+                       clay_companies_webhook_auth = ?, clay_contacts_webhook_auth = ?
+                   WHERE id = ?""",
                 (
-                    edit_name.strip(), owner_value, edit_industry.strip(),
-                    edit_company_country.strip(), edit_contact_country.strip(),
-                    edit_target_titles.strip(), int(edit_min_score), edit_current_cms.strip(),
-                    edit_department.strip(), ", ".join(edit_seniority), edit_job_level,
-                    edit_email_instructions.strip(), edit_clay_table_url.strip(),
+                    edit_name.strip(), owner_value, edit_industry.strip(), edit_company_country.strip(),
+                    ", ".join(edit_company_size), edit_contact_country.strip(), edit_target_titles.strip(),
+                    int(edit_min_score), edit_current_cms.strip(), edit_department.strip(),
+                    ", ".join(edit_seniority), "Exact", edit_email_instructions.strip(), edit_clay_table_url.strip(),
                     edit_companies_webhook.strip(), edit_contacts_webhook.strip(),
-                    edit_companies_webhook_auth.strip(), edit_contacts_webhook_auth.strip(),
-                    campaign_id,
+                    edit_companies_webhook_auth.strip(), edit_contacts_webhook_auth.strip(), campaign_id,
                 ),
             )
-
             if criteria_changed:
                 conn.execute(
                     """UPDATE campaigns SET status = 'Draft', criteria_approved = 0,
@@ -2047,296 +2110,112 @@ def show_edit_campaign_dialog(campaign_id):
             st.rerun()
 
 
-def get_invitation_email_config():
-    """Read SMTP settings from Streamlit Secrets; never store credentials in the app database."""
-    try:
-        config = dict(st.secrets.get("email", {}))
-    except Exception:
-        config = {}
-    return {
-        "smtp_server": config.get("smtp_server", "smtp.gmail.com"),
-        "smtp_port": int(config.get("smtp_port", 587)),
-        "sender_email": config.get("sender_email", "").strip(),
-        "app_password": config.get("app_password", "").replace(" ", "").strip(),
-        "sender_name": config.get("sender_name", "AI SDR Dashboard").strip(),
-        "dashboard_url": config.get("dashboard_url", "").strip().rstrip("/"),
-    }
-
-
-def invitation_email_is_configured():
-    config = get_invitation_email_config()
-    return bool(config["sender_email"] and config["app_password"] and config["dashboard_url"])
-
-
-def send_workspace_invitation_email(
-    recipient_name, recipient_email, permission, inviter_name, invitation_token
-):
-    """Send a real workspace invitation email using configured SMTP settings."""
-    config = get_invitation_email_config()
-    if not config["sender_email"] or not config["app_password"] or not config["dashboard_url"]:
-        raise ValueError(
-            "Email is not configured. Add sender_email, app_password, and dashboard_url "
-            "under [email] in Streamlit Secrets."
-        )
-
-    invitation_url = f"{config['dashboard_url']}?invite={invitation_token}"
-    safe_name = html.escape(recipient_name or "there")
-    safe_permission = html.escape(permission)
-    safe_inviter = html.escape(inviter_name or "Workspace Admin")
-    safe_url = html.escape(invitation_url, quote=True)
-
-    message = EmailMessage()
-    message["Subject"] = "You're invited to the AI SDR Dashboard"
-    message["From"] = formataddr((config["sender_name"], config["sender_email"]))
-    message["To"] = recipient_email
-    message.set_content(
-        f"Hi {recipient_name or 'there'},\n\n"
-        f"{inviter_name or 'Workspace Admin'} has invited you to the AI SDR Dashboard workspace.\n\n"
-        f"Workspace access: All campaigns\nYour permission: {permission}\n\n"
-        f"Accept your invitation using this link:\n{invitation_url}\n\n"
-        "This invitation link expires in 7 days.\n"
-        "If you were not expecting this invitation, you can ignore this email."
-    )
-    message.add_alternative(
-        f'<html><body style="font-family:Arial,sans-serif;color:#202938;line-height:1.55">'
-        f'<p>Hi {safe_name},</p>'
-        f'<p><strong>{safe_inviter}</strong> has invited you to the AI SDR Dashboard workspace.</p>'
-        f'<p><strong>Workspace access:</strong> All campaigns<br>'
-        f'<strong>Your permission:</strong> {safe_permission}</p>'
-        f'<p><a href="{safe_url}" style="display:inline-block;background:#5b35d5;color:#fff;'
-        f'padding:11px 18px;text-decoration:none;border-radius:6px">Accept Invitation</a></p>'
-        f'<p>This invitation link expires in 7 days.</p>'
-        f'<p>If you were not expecting this invitation, you can ignore this email.</p>'
-        f'</body></html>',
-        subtype="html",
-    )
-
-    with smtplib.SMTP(config["smtp_server"], config["smtp_port"], timeout=25) as server:
-        server.ehlo()
-        server.starttls(context=ssl.create_default_context())
-        server.ehlo()
-        server.login(config["sender_email"], config["app_password"])
-        server.send_message(message)
-
-
-def render_invitation_acceptance():
-    """Allow a mock invitee to accept a workspace-wide invitation from the email link."""
-    try:
-        invitation_token = st.query_params.get("invite")
-    except Exception:
-        invitation_token = None
-    if not invitation_token:
-        return
-
-    invitation = conn.execute(
-        """
-        SELECT id, member_email, member_name, permission, invitation_status,
-               invited_by, expires_at
-        FROM workspace_access
-        WHERE invitation_token = ?
-        """,
-        (invitation_token,),
-    ).fetchone()
-
-    st.divider()
-    with st.container(border=True):
-        st.subheader("Workspace Invitation")
-        if not invitation:
-            st.error("This invitation link is invalid or has already been revoked.")
-            return
-
-        (
-            access_id, member_email, member_name, permission,
-            invitation_status, invited_by, expires_at,
-        ) = invitation
-
-        if invitation_status == "Accepted":
-            st.success("This invitation has already been accepted.")
-            return
-        if invitation_status != "Pending":
-            st.warning("This invitation is no longer active.")
-            return
-
-        try:
-            is_expired = bool(expires_at) and datetime.fromisoformat(expires_at) < datetime.now()
-        except ValueError:
-            is_expired = False
-        if is_expired:
-            conn.execute(
-                "UPDATE workspace_access SET invitation_status = 'Expired', invitation_token = NULL WHERE id = ?",
-                (access_id,),
-            )
-            conn.commit()
-            st.error("This invitation has expired. Ask the Workspace Admin to send a new one.")
-            return
-
-        st.write(f"**Hello, {member_name}!**")
-        st.write(f"**Invited by:** {invited_by}")
-        st.write("**Workspace access:** All campaigns")
-        st.write(f"**Permission:** {permission}")
-        st.caption(f"Invitation sent to {member_email}.")
-        st.warning(
-            "Mock Mode note: accepting activates the simulated user and workspace permission. "
-            "It does not verify identity or provide secure authentication."
-        )
-        if st.button("Accept Invitation", type="primary", key="accept_workspace_invitation"):
-            now = datetime.now().isoformat(timespec="seconds")
-            conn.execute(
-                """
-                INSERT INTO team_members (email, name, status, created_at)
-                VALUES (?, ?, 'Active', ?)
-                ON CONFLICT(email) DO UPDATE SET name = excluded.name, status = 'Active'
-                """,
-                (member_email, member_name, now),
-            )
-            conn.execute(
-                "UPDATE workspace_access SET invitation_status = 'Accepted', accepted_at = ? WHERE id = ?",
-                (now, access_id),
-            )
-            conn.commit()
-            log_activity(
-                "Workspace invitation accepted",
-                None,
-                "Workspace",
-                member_name,
-                f"{member_email} accepted {permission} access to all campaigns.",
-            )
-            st.session_state["pending_mock_user_email"] = member_email
-            try:
-                del st.query_params["invite"]
-            except Exception:
-                pass
-            st.success("Invitation accepted. You are now previewing the dashboard as this mock user.")
-            st.rerun()
-
-
-render_invitation_acceptance()
-
-
-@st.dialog("Create New Campaign", width="small")
+@st.dialog("Create New Campaign", width="large")
 def show_create_campaign_dialog():
-    st.caption("* Required fields. Leave any other field blank if it is not relevant to this campaign.")
+    st.caption("Define your target companies and contacts to build a prospect list in Clay.")
 
     with st.form("create_campaign_dialog_form", enter_to_submit=False):
-        name_col, owner_col = st.columns(2)
-        with name_col:
-            campaign_name = st.text_input(
-                "Campaign Name *",
-                value="",
-            )
-        with owner_col:
-            campaign_owner = st.text_input(
-                "Campaign Owner *",
-                value="",
-            )
+        meta_cols = st.columns([1.35, 1.1, 2])
+        with meta_cols[0]:
+            campaign_name = st.text_input("Campaign Name *", placeholder="e.g., Q1 Marketing Campaign")
+        with meta_cols[1]:
+            campaign_owner = st.text_input("Campaign Owner *", placeholder="Salesperson name")
+        with meta_cols[2]:
+            clay_table_url = st.text_input("Clay Workbook Link", placeholder="https://app.clay.com/...")
 
-        industry_col, company_country_col = st.columns(2)
-        with industry_col:
-            industry = st.text_input("Industry", value="")
-        with company_country_col:
-            company_country = st.text_input("Company Country", value="")
+        st.divider()
+        company_col, contact_col = st.columns(2, gap="large")
+        with company_col:
+            with st.container(border=True):
+                st.markdown("### 🏢 Companies")
+                st.caption("Filter the companies you want to target.")
+                company_row1 = st.columns(2)
+                with company_row1[0]:
+                    industry = st.text_input("Industry", placeholder="e.g., Pharmaceuticals, Retail")
+                with company_row1[1]:
+                    company_country = st.text_input("Company Country", placeholder="e.g., United Kingdom")
+                company_row2 = st.columns(2)
+                with company_row2[0]:
+                    company_size = st.multiselect(
+                        "Company Size", COMPANY_SIZE_OPTIONS, default=[],
+                        placeholder="Select company size",
+                    )
+                with company_row2[1]:
+                    current_cms = st.text_input(
+                        "Current CMS", placeholder="Select or type CMS",
+                        help="Optional research note. Sales can enrich Current CMS in Clay after reviewing the company list.",
+                    )
 
-        contact_country_col, department_col = st.columns(2)
-        with contact_country_col:
-            contact_country = st.text_input("Contact Country", value="")
-        with department_col:
-            department = st.text_input("Department", value="")
+        with contact_col:
+            with st.container(border=True):
+                st.markdown("### 👥 Contacts")
+                st.caption("Define the right contacts at those companies.")
+                contact_row1 = st.columns(2)
+                with contact_row1[0]:
+                    target_titles = st.text_input(
+                        "Job Title", placeholder="e.g., Marketing Director, Head of Growth",
+                        help="Enter multiple job titles separated by commas.",
+                    )
+                with contact_row1[1]:
+                    seniority = st.multiselect(
+                        "Seniority", SENIORITY_OPTIONS, default=[],
+                        placeholder="Select seniority levels",
+                    )
+                contact_country = st.text_input("Contact Country", placeholder="e.g., United Kingdom")
+                with st.expander("Additional contact filter", expanded=False):
+                    department = st.text_input("Department", placeholder="e.g., Marketing, Sales")
 
-        titles_col, cms_col = st.columns(2)
-        with titles_col:
-            target_titles = st.text_input(
-                "Job Titles",
-                value="",
-                help="Enter multiple titles separated by commas. Leave blank for any job title.",
-            )
-        with cms_col:
-            current_cms = st.text_input(
-                "Current CMS (enrich in Clay after review)", value="",
-                help="Not used as a search filter in this phase. Sales will enrich CMS in Clay after reviewing companies."
-            )
-
-        seniority_col, job_level_col = st.columns(2)
-        with seniority_col:
-            seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=[])
-        with job_level_col:
-            job_level = st.selectbox(
-                "Job Level",
-                JOB_LEVEL_OPTIONS,
-                index=JOB_LEVEL_OPTIONS.index("Any"),
-            )
-
-        threshold = st.slider(
-            "Minimum ICP score",
-            min_value=0,
-            max_value=100,
-            value=0,
-            help="0 means no minimum score filter.",
-        )
-
-        with st.expander("Clay workbook and optional instructions", expanded=False):
-            clay_table_url = st.text_input(
-                "Clay Workbook Link",
-                value="",
-                help="Paste the workbook link after creating the campaign's Clay workbook and its two tables.",
-            )
+        st.divider()
+        st.markdown("**Campaign details and Clay delivery**")
+        with st.expander("Webhook destinations and optional settings", expanded=False):
             clay_companies_webhook_url = st.text_input(
-                "Companies Table Webhook URL",
-                value="",
-                help="Create a Webhooks → Monitor webhook source in the Companies table, then paste the HTTPS URL here.",
+                "Companies Table Webhook URL", placeholder="Paste the webhook URL from the Clay Companies table",
             )
             clay_contacts_webhook_url = st.text_input(
-                "Contacts Table Webhook URL",
-                value="",
-                help="Create a Webhooks → Monitor webhook source in the Contacts table, then paste the HTTPS URL here.",
+                "Contacts Table Webhook URL", placeholder="Paste the webhook URL from the Clay Contacts table",
             )
-            with st.expander("Optional webhook authentication", expanded=False):
+            st.caption("Optional webhook authentication")
+            auth_cols = st.columns(2)
+            with auth_cols[0]:
                 clay_companies_webhook_auth = st.text_input("Companies Webhook Auth Token", value="", type="password")
+            with auth_cols[1]:
                 clay_contacts_webhook_auth = st.text_input("Contacts Webhook Auth Token", value="", type="password")
+            threshold = st.slider("Minimum ICP score (review target)", 0, 100, 0)
             email_sequence_instructions = st.text_area(
-                "Email Sequence Instructions",
-                value="",
-                height=75,
+                "Email Sequence Instructions", value="", height=85,
+                placeholder="Add notes or instructions for the sales team (optional)",
             )
 
         submitted = st.form_submit_button("Create Campaign", type="primary", use_container_width=True)
 
+    cancel_col, _ = st.columns([1, 4])
+    with cancel_col:
+        if st.button("Cancel", key="cancel_create_campaign_dialog", use_container_width=True):
+            st.rerun()
+
     if submitted:
         if not campaign_name.strip() or not campaign_owner.strip():
             st.error("Please complete both required fields: Campaign Name and Campaign Owner.")
+        elif not split_clay_values(industry) and not split_clay_values(company_country) and not split_clay_values(", ".join(company_size)):
+            st.error("Add at least one company filter: Industry, Company Country, or Company Size.")
         else:
             campaign_id = str(uuid.uuid4())
             owner_value = campaign_owner.strip()
             conn.execute(
-                """
-                INSERT INTO campaigns
-                (id, name, industry, company_country, contact_country, target_titles,
-                 min_score, status, created_at, current_cms, department, seniority,
-                 job_level, email_sequence_instructions, clay_table_url, campaign_owner,
-                 clay_companies_webhook_url, clay_contacts_webhook_url,
-                 clay_companies_webhook_auth, clay_contacts_webhook_auth)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                """INSERT INTO campaigns
+                   (id, name, industry, company_country, company_size, contact_country, target_titles,
+                    min_score, status, created_at, current_cms, department, seniority, job_level,
+                    email_sequence_instructions, clay_table_url, campaign_owner,
+                    clay_companies_webhook_url, clay_contacts_webhook_url,
+                    clay_companies_webhook_auth, clay_contacts_webhook_auth)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    campaign_id,
-                    campaign_name.strip(),
-                    industry.strip(),
-                    company_country.strip(),
-                    contact_country.strip(),
-                    target_titles.strip(),
-                    int(threshold),
-                    "Draft",
-                    datetime.now().isoformat(timespec="seconds"),
-                    current_cms.strip(),
-                    department.strip(),
-                    ", ".join(seniority),
-                    job_level,
-                    email_sequence_instructions.strip(),
-                    clay_table_url.strip(),
-                    owner_value,
-                    clay_companies_webhook_url.strip(),
-                    clay_contacts_webhook_url.strip(),
-                    clay_companies_webhook_auth.strip(),
-                    clay_contacts_webhook_auth.strip(),
+                    campaign_id, campaign_name.strip(), industry.strip(), company_country.strip(),
+                    ", ".join(company_size), contact_country.strip(), target_titles.strip(), int(threshold),
+                    "Draft", datetime.now().isoformat(timespec="seconds"), current_cms.strip(), department.strip(),
+                    ", ".join(seniority), "Exact", email_sequence_instructions.strip(), clay_table_url.strip(),
+                    owner_value, clay_companies_webhook_url.strip(), clay_contacts_webhook_url.strip(),
+                    clay_companies_webhook_auth.strip(), clay_contacts_webhook_auth.strip(),
                 ),
             )
             conn.commit()
@@ -2543,6 +2422,7 @@ if active_page == "Campaigns":
             company_search_criteria_ready = bool(
                 split_clay_values(selected_row.get("industry", ""))
                 or split_clay_values(selected_row.get("company_country", ""))
+                or split_clay_values(selected_row.get("company_size", ""))
             )
             with build_col:
                 if mapping_needs_review:
@@ -2552,7 +2432,7 @@ if active_page == "Campaigns":
                 elif not clay_api_key:
                     st.caption("Clay API key is not configured.")
                 elif not company_search_criteria_ready:
-                    st.caption("Add Industry or Company Country. Current CMS is enriched after review in Clay.")
+                    st.caption("Add Industry, Company Country, or Company Size. Current CMS is enriched after review in Clay.")
                 elif not destination_ready:
                     st.caption("Add the Clay workbook link and both table webhook URLs in Edit Campaign.")
                 if st.button(
@@ -2682,16 +2562,17 @@ if active_page == "Campaigns":
                             conn.execute(
                                 """
                                 INSERT INTO campaigns
-                                (id, name, industry, company_country, contact_country, target_titles,
+                                (id, name, industry, company_country, company_size, contact_country, target_titles,
                                  min_score, status, created_at, current_cms, department, seniority,
                                  job_level, email_sequence_instructions, clay_table_url, campaign_owner)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     new_id,
                                     new_name,
                                     source_campaign.get("industry", "") or "",
                                     source_campaign.get("company_country", "") or "",
+                                    source_campaign.get("company_size", "") or "",
                                     source_campaign.get("contact_country", "") or "",
                                     source_campaign.get("target_titles", "") or "",
                                     int(source_campaign.get("min_score", 0) or 0),
@@ -2750,7 +2631,7 @@ if active_page == "Campaigns":
             elif not clay_api_key:
                 st.warning("Clay API key is not configured. Add it in Streamlit Cloud → App settings → Secrets.")
             elif not company_search_criteria_ready:
-                st.warning("Add at least Industry or Company Country as a company search filter. Current CMS is enriched after review in Clay.")
+                st.warning("Add at least Industry, Company Country, or Company Size as a company search filter. Current CMS is enriched after review in Clay.")
             elif not destination_ready:
                 st.warning(
                     "Before building data, add valid HTTPS links for the Clay workbook and its Companies and Contacts webhook tables in Edit Campaign. "
@@ -2770,7 +2651,7 @@ if active_page == "Campaigns":
                     )
                     st.link_button("Open Clay Workbook", clay_notice["workbook_url"])
                     if clay_notice.get("company_has_more") or clay_notice.get("contact_has_more"):
-                        st.warning("Clay had more matching results available than the configured 200-record cap for one entity. Review the search counts before expanding the list.")
+                        st.warning("Clay had more matching results available than the configured per-search cap. The returned records were sent for review; narrow the filters or raise the configured cap only after confirming the workspace plan.")
                     if clay_notice.get("validation_note"):
                         st.info(clay_notice["validation_note"])
                     if clay_notice.get("unverified_employer_count", 0):
@@ -2805,14 +2686,14 @@ if active_page == "Campaigns":
                     criteria_cols = st.columns(3)
                     criteria_cols[0].write(f"**Industry**\n\n{selected_row['industry'] or 'Any'}")
                     criteria_cols[1].write(f"**Company Country**\n\n{selected_row['company_country'] or 'Any'}")
-                    criteria_cols[2].write(f"**Contact Country**\n\n{selected_row['contact_country'] or 'Any'}")
+                    criteria_cols[2].write(f"**Company Size**\n\n{selected_row.get('company_size', '') or 'Any'}")
                     criteria_cols = st.columns(3)
-                    criteria_cols[0].write(f"**Job Titles**\n\n{selected_row['target_titles'] or 'Any'}")
-                    criteria_cols[1].write(f"**Department**\n\n{selected_row['department'] or 'Any'}")
-                    criteria_cols[2].write(f"**Current CMS enrichment target**\n\n{selected_row['current_cms'] or 'Not specified'}")
+                    criteria_cols[0].write(f"**Contact Country**\n\n{selected_row['contact_country'] or 'Any'}")
+                    criteria_cols[1].write(f"**Job Titles**\n\n{selected_row['target_titles'] or 'Any'}")
+                    criteria_cols[2].write(f"**Seniority**\n\n{selected_row['seniority'] or 'Any'}")
                     criteria_cols = st.columns(3)
-                    criteria_cols[0].write(f"**Seniority**\n\n{selected_row['seniority'] or 'Any'}")
-                    criteria_cols[1].write(f"**Job Level**\n\n{selected_row['job_level'] or 'Any'}")
+                    criteria_cols[0].write(f"**Department**\n\n{selected_row['department'] or 'Any'}")
+                    criteria_cols[1].write(f"**Current CMS enrichment target**\n\n{selected_row['current_cms'] or 'Not specified'}")
                     criteria_cols[2].write(f"**Minimum ICP Score (review target)**\n\n{int(selected_row['min_score'])}/100")
                     st.caption("Current CMS is not applied during sourcing. The sales team will run the website technology/CMS enrichment in Clay after reviewing the company list. Minimum ICP Score is a review target, not a Clay Search API filter in this phase.")
                     with st.expander("Email Sequence Instructions"):
@@ -3387,5 +3268,5 @@ elif active_page == "Settings":
     st.write("- Current CMS, work email, phone, and other enrichment are intentionally left for sales to run manually in Clay after list review.")
     st.write("- The workbook and its Companies/Contacts webhook tables must be created in Clay first. Add the workbook URL and both webhook URLs to the campaign.")
     st.write("- Search results are also retained in the dashboard's SQLite database for run history and diagnostics.")
-    st.write("- The search collector retrieves up to 200 companies and 200 contacts per execution, across pages; it reports when Clay indicates more results are available.")
+    st.write(f"- The search collector retrieves up to {get_clay_search_result_cap()} companies and {get_clay_search_result_cap()} contacts per search. The safe default is 50; raise it only after confirming the Clay workspace plan.")
     st.write("- Email drafts are not sent. Team invitations can be emailed when SMTP is configured in Streamlit Secrets.")
