@@ -1940,19 +1940,14 @@ def show_edit_campaign_dialog(campaign_id):
     ]
 
     with st.form(f"edit_campaign_modal_form_{campaign_id}", enter_to_submit=False):
-        meta_cols = st.columns([1.5, 1.2, 2])
-        with meta_cols[0]:
-            edit_name = st.text_input("Campaign Name *", value=str(campaign.get("name") or ""))
-        with meta_cols[1]:
-            edit_owner = st.text_input("Campaign Owner", value=str(campaign.get("campaign_owner", "Unassigned") or "Unassigned"))
-        with meta_cols[2]:
-            edit_clay_table_url = st.text_input(
-                "Clay Workbook Link", value=str(campaign.get("clay_table_url", "") or ""),
-                placeholder="https://app.clay.com/...",
-                help="The sales team will open this workbook to review companies and contacts.",
-            )
+        with st.container(border=True):
+            st.markdown("### 🎯 Campaign Details")
+            meta_cols = st.columns(2, gap="large")
+            with meta_cols[0]:
+                edit_name = st.text_input("Campaign Name *", value=str(campaign.get("name") or ""), placeholder="e.g., Q1 Marketing Campaign")
+            with meta_cols[1]:
+                edit_owner = st.text_input("Campaign Owner *", value=str(campaign.get("campaign_owner", "") or ""), placeholder="Salesperson name")
 
-        st.divider()
         company_col, contact_col = st.columns(2, gap="large")
         with company_col:
             with st.container(border=True):
@@ -1962,13 +1957,13 @@ def show_edit_campaign_dialog(campaign_id):
                 with company_row1[0]:
                     edit_industry = st.text_input("Industry", value=str(campaign.get("industry") or ""), placeholder="e.g., Pharmaceuticals, Retail")
                 with company_row1[1]:
-                    edit_company_country = st.text_input("Company Country", value=str(campaign.get("company_country") or ""), placeholder="e.g., United Kingdom")
-                company_row2 = st.columns(2)
-                with company_row2[0]:
                     edit_company_size = st.multiselect(
                         "Company Size", COMPANY_SIZE_OPTIONS, default=saved_sizes,
                         placeholder="Select company size",
                     )
+                company_row2 = st.columns(2)
+                with company_row2[0]:
+                    edit_company_country = st.text_input("Company Country", value=str(campaign.get("company_country") or ""), placeholder="e.g., United Kingdom")
                 with company_row2[1]:
                     edit_current_cms = st.text_input(
                         "Current CMS", value=str(campaign.get("current_cms") or ""),
@@ -1988,46 +1983,48 @@ def show_edit_campaign_dialog(campaign_id):
                         help="Enter multiple job titles separated by commas.",
                     )
                 with contact_row1[1]:
-                    edit_seniority = st.multiselect(
-                        "Seniority", SENIORITY_OPTIONS, default=saved_seniority,
-                        placeholder="Select seniority levels",
-                    )
-                edit_contact_country = st.text_input(
-                    "Contact Country", value=str(campaign.get("contact_country") or ""),
-                    placeholder="e.g., United Kingdom",
-                    help="Based on the person's location, not the company's headquarters.",
-                )
-                with st.expander("Additional contact filter", expanded=False):
                     edit_department = st.text_input(
                         "Department", value=str(campaign.get("department") or ""),
                         placeholder="e.g., Marketing, Sales",
                     )
+                contact_row2 = st.columns(2)
+                with contact_row2[0]:
+                    edit_seniority = st.multiselect(
+                        "Seniority", SENIORITY_OPTIONS, default=saved_seniority,
+                        placeholder="Select seniority levels",
+                    )
+                with contact_row2[1]:
+                    edit_contact_country = st.text_input(
+                        "Contact Country", value=str(campaign.get("contact_country") or ""),
+                        placeholder="e.g., United Kingdom",
+                        help="Based on the person's location, not the company's headquarters.",
+                    )
 
-        with st.expander("Campaign details and Clay delivery settings", expanded=False):
-            edit_min_score = st.slider(
-                "Minimum ICP score (review target)", 0, 100,
-                value=int(campaign.get("min_score", 0) or 0),
+        with st.expander("🗂️ Clay Details", expanded=True):
+            st.caption("Configure your Clay workbook and webhook endpoints for this campaign.")
+            edit_clay_table_url = st.text_input(
+                "Clay Workbook Link *", value=str(campaign.get("clay_table_url", "") or ""),
+                placeholder="https://app.clay.com/...",
+                help="The sales team will open this workbook to review companies and contacts.",
             )
-            edit_email_instructions = st.text_area(
-                "Email Sequence Instructions", value=str(campaign.get("email_sequence_instructions", "") or ""), height=90,
-            )
-            edit_companies_webhook = st.text_input(
-                "Companies Table Webhook URL", value=str(campaign.get("clay_companies_webhook_url", "") or ""),
-                placeholder="Paste the webhook URL from the Clay Companies table",
-            )
-            edit_contacts_webhook = st.text_input(
-                "Contacts Table Webhook URL", value=str(campaign.get("clay_contacts_webhook_url", "") or ""),
-                placeholder="Paste the webhook URL from the Clay Contacts table",
-            )
-            st.caption("Optional webhook authentication")
-            auth_cols = st.columns(2)
-            with auth_cols[0]:
+            webhook_cols = st.columns(2, gap="large")
+            with webhook_cols[0]:
+                edit_companies_webhook = st.text_input(
+                    "Companies Table Webhook URL *", value=str(campaign.get("clay_companies_webhook_url", "") or ""),
+                    placeholder="https://api.clay.com/v3/sources/webhook/...",
+                )
+                edit_contacts_webhook = st.text_input(
+                    "Contacts Table Webhook URL *", value=str(campaign.get("clay_contacts_webhook_url", "") or ""),
+                    placeholder="https://api.clay.com/v3/sources/webhook/...",
+                )
+            with webhook_cols[1]:
                 edit_companies_webhook_auth = st.text_input(
                     "Companies Webhook Auth Token", value=str(campaign.get("clay_companies_webhook_auth", "") or ""), type="password",
+                    help="Optional token configured on the Companies webhook in Clay.",
                 )
-            with auth_cols[1]:
                 edit_contacts_webhook_auth = st.text_input(
                     "Contacts Webhook Auth Token", value=str(campaign.get("clay_contacts_webhook_auth", "") or ""), type="password",
+                    help="Optional token configured on the Contacts webhook in Clay.",
                 )
 
         save_changes = st.form_submit_button("Save Changes", type="primary", use_container_width=True)
@@ -2040,10 +2037,14 @@ def show_edit_campaign_dialog(campaign_id):
             st.rerun()
 
     if save_changes:
-        if not edit_name.strip():
-            st.error("Please enter a campaign name.")
+        if not edit_name.strip() or not edit_owner.strip():
+            st.error("Please enter both Campaign Name and Campaign Owner.")
+        elif not edit_clay_table_url.strip() or not edit_companies_webhook.strip() or not edit_contacts_webhook.strip():
+            st.error("Please complete the Clay Workbook Link and both webhook URLs in Clay Details.")
+        elif not split_clay_values(edit_industry) and not split_clay_values(edit_company_country) and not edit_company_size:
+            st.error("Add at least one company filter: Industry, Company Size, or Company Country.")
         else:
-            owner_value = edit_owner.strip() or "Unassigned"
+            owner_value = edit_owner.strip()
             original_campaign = campaign_as_dict(campaign_id) or {}
             search_criteria_fields = {
                 "industry": edit_industry.strip(),
@@ -2062,17 +2063,15 @@ def show_edit_campaign_dialog(campaign_id):
             conn.execute(
                 """UPDATE campaigns
                    SET name = ?, campaign_owner = ?, industry = ?, company_country = ?, company_size = ?,
-                       contact_country = ?, target_titles = ?, min_score = ?, current_cms = ?,
-                       department = ?, seniority = ?, job_level = ?, email_sequence_instructions = ?,
-                       clay_table_url = ?, clay_companies_webhook_url = ?, clay_contacts_webhook_url = ?,
+                       contact_country = ?, target_titles = ?, current_cms = ?, department = ?, seniority = ?,
+                       job_level = ?, clay_table_url = ?, clay_companies_webhook_url = ?, clay_contacts_webhook_url = ?,
                        clay_companies_webhook_auth = ?, clay_contacts_webhook_auth = ?
                    WHERE id = ?""",
                 (
                     edit_name.strip(), owner_value, edit_industry.strip(), edit_company_country.strip(),
                     ", ".join(edit_company_size), edit_contact_country.strip(), edit_target_titles.strip(),
-                    int(edit_min_score), edit_current_cms.strip(), edit_department.strip(),
-                    ", ".join(edit_seniority), "Exact", edit_email_instructions.strip(), edit_clay_table_url.strip(),
-                    edit_companies_webhook.strip(), edit_contacts_webhook.strip(),
+                    edit_current_cms.strip(), edit_department.strip(), ", ".join(edit_seniority), "Exact",
+                    edit_clay_table_url.strip(), edit_companies_webhook.strip(), edit_contacts_webhook.strip(),
                     edit_companies_webhook_auth.strip(), edit_contacts_webhook_auth.strip(), campaign_id,
                 ),
             )
@@ -2115,15 +2114,14 @@ def show_create_campaign_dialog():
     st.caption("Define your target companies and contacts to build a prospect list in Clay.")
 
     with st.form("create_campaign_dialog_form", enter_to_submit=False):
-        meta_cols = st.columns([1.35, 1.1, 2])
-        with meta_cols[0]:
-            campaign_name = st.text_input("Campaign Name *", placeholder="e.g., Q1 Marketing Campaign")
-        with meta_cols[1]:
-            campaign_owner = st.text_input("Campaign Owner *", placeholder="Salesperson name")
-        with meta_cols[2]:
-            clay_table_url = st.text_input("Clay Workbook Link", placeholder="https://app.clay.com/...")
+        with st.container(border=True):
+            st.markdown("### 🎯 Campaign Details")
+            meta_cols = st.columns(2, gap="large")
+            with meta_cols[0]:
+                campaign_name = st.text_input("Campaign Name *", placeholder="e.g., Q1 Marketing Campaign")
+            with meta_cols[1]:
+                campaign_owner = st.text_input("Campaign Owner *", placeholder="Salesperson name")
 
-        st.divider()
         company_col, contact_col = st.columns(2, gap="large")
         with company_col:
             with st.container(border=True):
@@ -2133,13 +2131,13 @@ def show_create_campaign_dialog():
                 with company_row1[0]:
                     industry = st.text_input("Industry", placeholder="e.g., Pharmaceuticals, Retail")
                 with company_row1[1]:
-                    company_country = st.text_input("Company Country", placeholder="e.g., United Kingdom")
-                company_row2 = st.columns(2)
-                with company_row2[0]:
                     company_size = st.multiselect(
                         "Company Size", COMPANY_SIZE_OPTIONS, default=[],
                         placeholder="Select company size",
                     )
+                company_row2 = st.columns(2)
+                with company_row2[0]:
+                    company_country = st.text_input("Company Country", placeholder="e.g., United Kingdom")
                 with company_row2[1]:
                     current_cms = st.text_input(
                         "Current CMS", placeholder="Select or type CMS",
@@ -2157,34 +2155,39 @@ def show_create_campaign_dialog():
                         help="Enter multiple job titles separated by commas.",
                     )
                 with contact_row1[1]:
+                    department = st.text_input("Department", placeholder="e.g., Marketing, Sales")
+                contact_row2 = st.columns(2)
+                with contact_row2[0]:
                     seniority = st.multiselect(
                         "Seniority", SENIORITY_OPTIONS, default=[],
                         placeholder="Select seniority levels",
                     )
-                contact_country = st.text_input("Contact Country", placeholder="e.g., United Kingdom")
-                with st.expander("Additional contact filter", expanded=False):
-                    department = st.text_input("Department", placeholder="e.g., Marketing, Sales")
+                with contact_row2[1]:
+                    contact_country = st.text_input("Contact Country", placeholder="e.g., United Kingdom")
 
-        st.divider()
-        st.markdown("**Campaign details and Clay delivery**")
-        with st.expander("Webhook destinations and optional settings", expanded=False):
-            clay_companies_webhook_url = st.text_input(
-                "Companies Table Webhook URL", placeholder="Paste the webhook URL from the Clay Companies table",
+        with st.expander("🗂️ Clay Details", expanded=True):
+            st.caption("Configure your Clay workbook and webhook endpoints for this campaign.")
+            clay_table_url = st.text_input(
+                "Clay Workbook Link *", placeholder="https://app.clay.com/...",
+                help="The sales team will open this workbook to review companies and contacts.",
             )
-            clay_contacts_webhook_url = st.text_input(
-                "Contacts Table Webhook URL", placeholder="Paste the webhook URL from the Clay Contacts table",
-            )
-            st.caption("Optional webhook authentication")
-            auth_cols = st.columns(2)
-            with auth_cols[0]:
-                clay_companies_webhook_auth = st.text_input("Companies Webhook Auth Token", value="", type="password")
-            with auth_cols[1]:
-                clay_contacts_webhook_auth = st.text_input("Contacts Webhook Auth Token", value="", type="password")
-            threshold = st.slider("Minimum ICP score (review target)", 0, 100, 0)
-            email_sequence_instructions = st.text_area(
-                "Email Sequence Instructions", value="", height=85,
-                placeholder="Add notes or instructions for the sales team (optional)",
-            )
+            webhook_cols = st.columns(2, gap="large")
+            with webhook_cols[0]:
+                clay_companies_webhook_url = st.text_input(
+                    "Companies Table Webhook URL *", placeholder="https://api.clay.com/v3/sources/webhook/...",
+                )
+                clay_contacts_webhook_url = st.text_input(
+                    "Contacts Table Webhook URL *", placeholder="https://api.clay.com/v3/sources/webhook/...",
+                )
+            with webhook_cols[1]:
+                clay_companies_webhook_auth = st.text_input(
+                    "Companies Webhook Auth Token", value="", type="password",
+                    help="Optional token configured on the Companies webhook in Clay.",
+                )
+                clay_contacts_webhook_auth = st.text_input(
+                    "Contacts Webhook Auth Token", value="", type="password",
+                    help="Optional token configured on the Contacts webhook in Clay.",
+                )
 
         submitted = st.form_submit_button("Create Campaign", type="primary", use_container_width=True)
 
@@ -2196,8 +2199,10 @@ def show_create_campaign_dialog():
     if submitted:
         if not campaign_name.strip() or not campaign_owner.strip():
             st.error("Please complete both required fields: Campaign Name and Campaign Owner.")
-        elif not split_clay_values(industry) and not split_clay_values(company_country) and not split_clay_values(", ".join(company_size)):
-            st.error("Add at least one company filter: Industry, Company Country, or Company Size.")
+        elif not clay_table_url.strip() or not clay_companies_webhook_url.strip() or not clay_contacts_webhook_url.strip():
+            st.error("Please complete the Clay Workbook Link and both webhook URLs in Clay Details.")
+        elif not split_clay_values(industry) and not split_clay_values(company_country) and not company_size:
+            st.error("Add at least one company filter: Industry, Company Size, or Company Country.")
         else:
             campaign_id = str(uuid.uuid4())
             owner_value = campaign_owner.strip()
@@ -2211,9 +2216,9 @@ def show_create_campaign_dialog():
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     campaign_id, campaign_name.strip(), industry.strip(), company_country.strip(),
-                    ", ".join(company_size), contact_country.strip(), target_titles.strip(), int(threshold),
-                    "Draft", datetime.now().isoformat(timespec="seconds"), current_cms.strip(), department.strip(),
-                    ", ".join(seniority), "Exact", email_sequence_instructions.strip(), clay_table_url.strip(),
+                    ", ".join(company_size), contact_country.strip(), target_titles.strip(),
+                    0, "Draft", datetime.now().isoformat(timespec="seconds"), current_cms.strip(),
+                    department.strip(), ", ".join(seniority), "Exact", "", clay_table_url.strip(),
                     owner_value, clay_companies_webhook_url.strip(), clay_contacts_webhook_url.strip(),
                     clay_companies_webhook_auth.strip(), clay_contacts_webhook_auth.strip(),
                 ),
