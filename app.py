@@ -1139,12 +1139,41 @@ def run_clay_company_search(campaign, campaign_id, api_key):
         size_field = schema.get("sizes") or schema.get("company_sizes") or schema.get("company_size")
         if not size_field:
             raise RuntimeError("Clay's live company-search schema does not expose a company size filter.")
-        unknown_size_labels = [label for label in company_size_labels if label not in COMPANY_SIZE_CLAY_VALUES]
+        # Accept the dashboard's exact display labels plus common shorthand ranges.
+        # Clay's Public API uses bucket boundary codes, so 51-500 spans two buckets.
+        company_size_aliases = {
+            "51-500": ["51-200 employees", "201-500 employees"],
+            "51-500 employees": ["51-200 employees", "201-500 employees"],
+            "501-1000": ["501-1,000 employees"],
+            "501-1000 employees": ["501-1,000 employees"],
+            "1001-5000": ["1,001-5,000 employees"],
+            "1001-5000 employees": ["1,001-5,000 employees"],
+            "5001-10000": ["5,001-10,000 employees"],
+            "5001-10000 employees": ["5,001-10,000 employees"],
+            "10000+": ["10,001+ employees"],
+            "10000+ employees": ["10,001+ employees"],
+        }
+        expanded_size_labels = []
+        for label in company_size_labels:
+            normalized_label = re.sub(r"\\s+", " ", str(label).strip().lower())
+            normalized_label = normalized_label.replace("–", "-").replace("—", "-")
+            normalized_label = normalized_label.replace(",", "")
+            alias_target = company_size_aliases.get(normalized_label)
+            if alias_target:
+                expanded_size_labels.extend(alias_target)
+            else:
+                expanded_size_labels.append(label)
+
+        unknown_size_labels = [
+            label for label in expanded_size_labels
+            if label not in COMPANY_SIZE_CLAY_VALUES
+        ]
         if unknown_size_labels:
             raise ValueError("Unsupported Company Size option(s): " + ", ".join(unknown_size_labels))
-        # Clay's `sizes` API filter expects bucket codes such as 2, 10, 50, 500,
-        # 1000, 5000, and 10000, not the display labels shown in its UI.
-        company_size_codes = [COMPANY_SIZE_CLAY_VALUES[label] for label in company_size_labels]
+        # Clay's `sizes` filter expects bucket codes, not display labels.
+        company_size_codes = list(dict.fromkeys(
+            COMPANY_SIZE_CLAY_VALUES[label] for label in expanded_size_labels
+        ))
         filters["sizes"] = _clay_filter_values(size_field, company_size_codes, "Company Size")
 
     # Current CMS is intentionally not used as a search filter in this phase.
