@@ -144,20 +144,17 @@ st.markdown(
 
     /* Hide chevrons on free-entry tag fields in both page and dialog layouts.
        Do not scope this to role=dialog: the campaign form can render in the main page. */
-    .st-key-create_industry [data-baseweb="select"] > div:last-child svg,
-    .st-key-create_company_city [data-baseweb="select"] > div:last-child svg,
-    .st-key-create_company_state [data-baseweb="select"] > div:last-child svg,
-    .st-key-create_current_cms [data-baseweb="select"] > div:last-child svg,
-    .st-key-create_target_titles [data-baseweb="select"] > div:last-child svg,
-    .st-key-create_department [data-baseweb="select"] > div:last-child svg,
-    .st-key-edit_industry [data-baseweb="select"] > div:last-child svg,
-    .st-key-edit_company_city [data-baseweb="select"] > div:last-child svg,
-    .st-key-edit_company_state [data-baseweb="select"] > div:last-child svg,
-    .st-key-edit_current_cms [data-baseweb="select"] > div:last-child svg,
-    .st-key-edit_target_titles [data-baseweb="select"] > div:last-child svg,
-    .st-key-edit_department [data-baseweb="select"] > div:last-child svg {
+    /* Hide the nested BaseWeb multi-select end-indicator container (native chevron).
+       Target the indicator container, not only an SVG at the wrong DOM level.
+       Selected tag remove controls are not targeted. */
+    .st-key-create_industry [data-baseweb="select"] > div > div:last-child,\n    .st-key-create_company_city [data-baseweb="select"] > div > div:last-child,\n    .st-key-create_company_state [data-baseweb="select"] > div > div:last-child,\n    .st-key-create_current_cms [data-baseweb="select"] > div > div:last-child,\n    .st-key-create_target_titles [data-baseweb="select"] > div > div:last-child,\n    .st-key-create_department [data-baseweb="select"] > div > div:last-child,\n    .st-key-edit_industry [data-baseweb="select"] > div > div:last-child,\n    .st-key-edit_company_city [data-baseweb="select"] > div > div:last-child,\n    .st-key-edit_company_state [data-baseweb="select"] > div > div:last-child,\n    .st-key-edit_current_cms [data-baseweb="select"] > div > div:last-child,\n    .st-key-edit_target_titles [data-baseweb="select"] > div > div:last-child,\n    .st-key-edit_department [data-baseweb="select"] > div > div:last-child {
         display: none !important;
+        width: 0 !important;
+        min-width: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
     }
+
     div[role="dialog"] [data-testid="stMultiSelect"] [data-baseweb="select"] span {
         white-space: normal !important;
     }
