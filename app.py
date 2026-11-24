@@ -1587,7 +1587,12 @@ def _extract_person_job_title(row, experience):
 
 
 def _parse_clay_person_row(row):
-    """Normalize Clay's returned profile fields across snake_case/camelCase shapes."""
+    """Normalize Clay Public API profile fields, including the Raw Clay Data shape."""
+    # Some Clay people-search responses expose the latest role and location as
+    # flattened fields rather than nested current_experience objects.
+    structured_location = _first_nonempty(row, "structured_location", "structuredLocation")
+    if not isinstance(structured_location, dict):
+        structured_location = {}
     experience = _extract_current_experience(row)
     company = _first_nonempty(
         experience, "company", "organization", "current_company", "currentCompany"
@@ -1604,6 +1609,17 @@ def _parse_clay_person_row(row):
     else:
         location_text = str(location or "")
         location_country = _first_nonempty(row, "location_country", "locationCountry", "country")
+    if structured_location:
+        city = _first_nonempty(structured_location, "city", "city_name", "cityName")
+        state = _first_nonempty(structured_location, "state", "state_name", "stateName")
+        region = _first_nonempty(structured_location, "region")
+        structured_country = _first_nonempty(
+            structured_location, "country", "country_name", "countryName"
+        )
+        location_parts = [str(value).strip() for value in (city, state, region, structured_country) if value]
+        if location_parts:
+            location_text = ", ".join(dict.fromkeys(location_parts))
+        location_country = structured_country or location_country
     if not location_country and location_text:
         location_lower = location_text.casefold()
         country_candidates = [
@@ -1632,12 +1648,16 @@ def _parse_clay_person_row(row):
         department = ", ".join(str(value) for value in department)
 
     company_name = (
-        _first_nonempty(row, "company_name", "companyName", "current_company_name", "currentCompanyName")
+        _first_nonempty(row, "company_name", "companyName", "current_company_name", "currentCompanyName",
+                        "latest_experience_company", "latestExperienceCompany")
+        or _first_nonempty(experience, "company", "organization", "current_company", "currentCompany")
         or _first_nonempty(company, "name", "company_name", "companyName")
         or _first_nonempty(top_company, "name", "company_name", "companyName")
     )
+    if isinstance(company_name, dict):
+        company_name = _first_nonempty(company_name, "name", "company_name", "companyName")
     company_domain = (
-        _first_nonempty(row, "company_domain", "companyDomain", "current_company_domain", "currentCompanyDomain")
+        _first_nonempty(row, "company_domain", "companyDomain", "current_company_domain", "currentCompanyDomain", "domain")
         or _first_nonempty(experience, "company_domain", "companyDomain")
         or _first_nonempty(company, "domain", "website", "company_domain", "companyDomain")
         or _first_nonempty(top_company, "domain", "website", "company_domain", "companyDomain")
@@ -1652,6 +1672,41 @@ def _parse_clay_person_row(row):
         or _first_nonempty(top_company, "linkedin_url", "linkedinUrl", "social_url", "profile_url", "url")
     )
     job_title, job_title_source, title_candidates = _extract_person_job_title(row, experience)
+    latest_title = _first_nonempty(row, "latest_experience_title", "latestExperienceTitle")
+    if latest_title:
+        job_title = str(latest_title).strip()
+        job_title_source = "latest_experience_title"
+        title_candidates = list(dict.fromkeys([job_title] + title_candidates))
+
+    # Clay's sample payload does not include explicit seniority/department
+    # fields. Derive conservative labels from the returned title only when absent.
+    title_for_classification = str(job_title or "").casefold()
+    if not seniority and title_for_classification:
+        seniority_rules = [
+            (r"\b(chief|c-suite|ceo|cto|cfo|coo|cmo|cio|cpo)\b", "C-suite"),
+            (r"\b(vice president|svp|evp|vp)\b", "VP"),
+            (r"\bdirector\b", "Director"),
+            (r"\bhead of\b", "Head"),
+            (r"\bmanager\b", "Manager"),
+            (r"\bsenior\b", "Senior"),
+        ]
+        seniority = next(
+            (label for pattern, label in seniority_rules if re.search(pattern, title_for_classification)),
+            "",
+        )
+    if not department and title_for_classification:
+        department_rules = [
+            (("marketing", "brand", "communications", "growth", "demand generation"), "Marketing"),
+            (("sales", "business development", "account executive"), "Sales"),
+            (("engineering", "software", "developer", "technical"), "Engineering"),
+            (("human resources", "recruiting", "talent acquisition", "people operations"), "Human Resources"),
+            (("finance", "accounting", "controller"), "Finance"),
+            (("operations",), "Operations"),
+        ]
+        department = next(
+            (label for tokens, label in department_rules if any(token in title_for_classification for token in tokens)),
+            "",
+        )
 
     return {
         "clay_profile_id": str(_first_nonempty(row, "clay_profile_id", "clayProfileId", "id", "profile_id", "profileId") or ""),
@@ -1669,7 +1724,7 @@ def _parse_clay_person_row(row):
         "company_name": str(company_name or ""),
         "company_domain": str(company_domain or ""),
         "company_linkedin_url": str(company_linkedin_url or ""),
-        "linkedin_url": str(_first_nonempty(row, "linkedin_url", "linkedinUrl", "profile_url", "profileUrl", "linkedInUrl") or ""),
+        "linkedin_url": str(_first_nonempty(row, "linkedin_url", "linkedinUrl", "profile_url", "profileUrl", "linkedInUrl", "url") or ""),
     }
 
 
