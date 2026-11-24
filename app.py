@@ -743,7 +743,10 @@ def on_overview_campaign_checkbox_change(campaign_id, campaign_ids):
 
 
 def get_clay_api_key():
-    """Read the Clay Public API key from Streamlit Secrets or an environment variable."""
+    """Return the dashboard-entered Clay key, then fall back to deployment secrets."""
+    session_value = str(st.session_state.get("clay_api_key_override", "") or "").strip()
+    if session_value:
+        return session_value
     secret_value = ""
     try:
         clay_secrets = st.secrets.get("clay", {})
@@ -755,24 +758,31 @@ def get_clay_api_key():
 
 
 def get_clay_search_result_cap():
-    """Return the per-search result cap configured for this Clay workspace.
+    """Legacy shared cap retained for compatibility with older settings."""
+    return get_clay_company_result_cap()
 
-    Free and Trial workspaces are limited to 50 results per search. Keep 50 as
-    the safe default; only raise this value after checking the plan for the
-    workspace that owns the API key. This implementation caps one search at 500.
-    """
-    configured = 50
-    try:
-        clay_secrets = st.secrets.get("clay", {})
-        if hasattr(clay_secrets, "get"):
-            configured = clay_secrets.get("max_results_per_search", 50)
-    except Exception:
-        configured = 50
+
+def _get_clay_record_limit(session_key, secret_key):
+    configured = st.session_state.get(session_key, None)
+    if configured is None:
+        try:
+            clay_secrets = st.secrets.get("clay", {})
+            configured = clay_secrets.get(secret_key, 50) if hasattr(clay_secrets, "get") else 50
+        except Exception:
+            configured = 50
     try:
         configured = int(configured)
     except (TypeError, ValueError):
         configured = 50
     return max(1, min(configured, 500))
+
+
+def get_clay_company_result_cap():
+    return _get_clay_record_limit("clay_company_limit", "max_companies_per_search")
+
+
+def get_clay_contact_result_cap():
+    return _get_clay_record_limit("clay_contact_limit", "max_contacts_per_search")
 
 
 def join_tag_values(values):
@@ -3471,23 +3481,146 @@ elif active_page == "Activity Log":
 
 elif active_page == "Settings":
     st.subheader("Settings")
-    st.caption("Dashboard mode and integration status")
-    settings_cols = st.columns(3)
-    settings_cols[0].metric("Execution Mode", "Clay API Test" if get_clay_api_key() else "Test Mode")
-    settings_cols[1].metric("Clay API Key", "Configured" if get_clay_api_key() else "Not Configured")
-    settings_cols[2].metric(
-        "Invitation Email",
-        "Configured" if invitation_email_is_configured() else "Not Configured",
+    st.caption("Configure Clay integration, general settings, users and dashboard preferences.")
+
+    clay_tab, general_tab, users_tab = st.tabs(
+        ["🔌 Clay Configuration", "⚙️ General Settings", "👥 Users"]
     )
-    st.markdown("#### Connect Clay")
-    st.write("Build Campaign Data uses Clay's Public Search API to find companies and people, then sends the resulting rows to pre-created Clay webhook tables in the campaign's workbook.")
-    st.write("To connect it, create a Clay API key in your Clay workspace under API and CLI → API keys, then add it to Streamlit Cloud → App settings → Secrets:")
-    st.code('[clay]\napi_key = "PASTE_YOUR_CLAY_API_KEY_HERE"', language="toml")
-    st.caption("Keep the key in Streamlit Secrets. Do not paste it into the dashboard, GitHub source code, or this chat.")
-    st.markdown("#### Integration scope")
-    st.write("- Company search applies Industry and Company Country. Contact search is scoped to the discovered companies and applies Job Titles, Department, Seniority/Job Level, and Contact Country.")
-    st.write("- Current CMS, work email, phone, and other enrichment are intentionally left for sales to run manually in Clay after list review.")
-    st.write("- The workbook and its Companies/Contacts webhook tables must be created in Clay first. Add the workbook URL and both webhook URLs to the campaign.")
-    st.write("- Search results are also retained in the dashboard's SQLite database for run history and diagnostics.")
-    st.write(f"- The search collector retrieves up to {get_clay_search_result_cap()} companies and {get_clay_search_result_cap()} contacts per search. The safe default is 50; raise it only after confirming the Clay workspace plan.")
-    st.write("- Email drafts are not sent. Team invitations can be emailed when SMTP is configured in Streamlit Secrets.")
+
+    with clay_tab:
+        st.markdown("### Clay API Configuration")
+        st.write("Add your Clay API key to connect the dashboard with your Clay account.")
+        saved_key = get_clay_api_key()
+        with st.form("clay_api_configuration_form"):
+            entered_key = st.text_input(
+                "Clay API Key",
+                value="",
+                type="password",
+                placeholder="Paste your Clay API key",
+                help="The same API key is used for all company and contact searches.",
+            )
+            save_key = st.form_submit_button("Save API Key", type="primary")
+        if save_key:
+            if entered_key.strip():
+                st.session_state["clay_api_key_override"] = entered_key.strip()
+                st.session_state["clay_api_connection_status"] = "Not tested"
+                st.success("Clay API key saved for this active app session.")
+                st.rerun()
+            else:
+                st.warning("Enter an API key before saving.")
+
+        current_key = get_clay_api_key()
+        connection_cols = st.columns([1, 2])
+        with connection_cols[0]:
+            if st.button("Test Connection", disabled=not bool(current_key), key="test_clay_connection"):
+                try:
+                    response = requests.get(
+                        "https://api.clay.com/public/v0/search/filters-mode/fields",
+                        headers={"clay-api-key": current_key},
+                        timeout=20,
+                    )
+                    if response.ok:
+                        st.session_state["clay_api_connection_status"] = "Connected"
+                        st.session_state["clay_api_last_tested"] = datetime.now().strftime("%d %b %Y, %I:%M %p")
+                        st.success("Clay connection successful.")
+                    else:
+                        st.session_state["clay_api_connection_status"] = "Not Connected"
+                        st.error(f"Clay connection failed (HTTP {response.status_code}). Check the API key and workspace access.")
+                except requests.RequestException as exc:
+                    st.session_state["clay_api_connection_status"] = "Not Connected"
+                    st.error(f"Could not reach Clay: {exc}")
+        with connection_cols[1]:
+            if current_key:
+                st.caption("An API key is configured. The same key will be used for company and contact searches.")
+            else:
+                st.caption("No Clay API key is configured yet.")
+
+        status = st.session_state.get(
+            "clay_api_connection_status",
+            "Configured — not tested" if current_key else "Not Connected",
+        )
+        if status == "Connected":
+            st.success(f"Connection Status: **Connected** · Last tested: {st.session_state.get('clay_api_last_tested', '—')}")
+        elif current_key:
+            st.warning(f"Connection Status: **{status}**")
+        else:
+            st.info("Connection Status: **Not Connected**")
+
+        st.markdown("---")
+        st.markdown("### Record Limit Configuration")
+        st.write("Set the maximum number of records to fetch from Clay for each search.")
+        limit_options = [10, 25, 50, 100, 150, 250]
+        limit_cols = st.columns(2)
+        with limit_cols[0]:
+            company_limit = st.selectbox(
+                "Maximum Companies",
+                limit_options,
+                index=limit_options.index(get_clay_company_result_cap()) if get_clay_company_result_cap() in limit_options else 2,
+                key="clay_company_limit_picker",
+            )
+        with limit_cols[1]:
+            contact_limit = st.selectbox(
+                "Maximum Contacts",
+                limit_options,
+                index=limit_options.index(get_clay_contact_result_cap()) if get_clay_contact_result_cap() in limit_options else 2,
+                key="clay_contact_limit_picker",
+            )
+        if st.button("Save Record Limits", key="save_clay_record_limits"):
+            st.session_state["clay_company_limit"] = int(company_limit)
+            st.session_state["clay_contact_limit"] = int(contact_limit)
+            st.success("Record limits saved for this active app session.")
+            st.rerun()
+        st.info(
+            "Clay enforces limits based on your workspace plan. Selecting 100 or 150 here "
+            "does not bypass a Free/Trial plan's per-search allowance. Confirm your plan before increasing limits."
+        )
+
+        st.caption(
+            f"Current limits: {get_clay_company_result_cap()} companies and "
+            f"{get_clay_contact_result_cap()} contacts per search."
+        )
+
+    with general_tab:
+        st.markdown("### General Settings")
+        general_cols = st.columns(2)
+        general_cols[0].metric(
+            "Invitation Email",
+            "Configured" if invitation_email_is_configured() else "Not Configured",
+        )
+        general_cols[1].metric(
+            "Clay API Key",
+            "Configured" if get_clay_api_key() else "Not Configured",
+        )
+        st.markdown("#### Clay Integration Scope")
+        st.write(
+            "Company search applies Industry and Company Country. Contact search is scoped "
+            "to discovered companies and applies Job Titles, Department, Seniority/Job Level, "
+            "and Contact Country."
+        )
+        st.write(
+            "Current CMS, work email, phone, and other enrichment are left for sales to run "
+            "manually in Clay after list review."
+        )
+        st.write(
+            "The Clay workbook and its Companies/Contacts webhook tables must be created in "
+            "Clay first. Add the workbook URL and both webhook URLs to the campaign."
+        )
+        st.write(
+            "Search results are retained in the dashboard's SQLite database for run history "
+            "and diagnostics. Email drafts are not sent."
+        )
+        st.caption(
+            "Team invitation emails require SMTP settings in Streamlit Secrets."
+        )
+
+    with users_tab:
+        st.markdown("### Users")
+        st.write(
+            "Manage dashboard access and team permissions from the existing Shared Users "
+            "section. This Settings tab is a shortcut/overview; existing access controls "
+            "and permissions remain unchanged."
+        )
+        st.info(
+            "User access management remains in its current location. No existing users, "
+            "roles, or permissions are changed by this update."
+        )
