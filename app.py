@@ -141,6 +141,22 @@ st.markdown(
         color: #111827 !important;
         border: 1px solid #d1d5db !important;
     }
+
+    /* Hide chevrons only on free-entry tag fields; preserve tag remove icons. */
+    div[role="dialog"] .st-key-create_industry [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-create_company_city [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-create_company_state [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-create_current_cms [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-create_target_titles [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-create_department [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-edit_industry [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-edit_company_city [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-edit_company_state [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-edit_current_cms [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-edit_target_titles [data-baseweb="select"] > div:last-child svg,
+    div[role="dialog"] .st-key-edit_department [data-baseweb="select"] > div:last-child svg {
+        display: none !important;
+    }
     div[role="dialog"] [data-testid="stMultiSelect"] [data-baseweb="select"] span {
         white-space: normal !important;
     }
@@ -2264,6 +2280,7 @@ def show_edit_campaign_dialog(campaign_id):
                     "Industry", options=[], default=split_clay_values(campaign.get("industry", "")),
                     accept_new_options=True, placeholder="Add or select industries",
                     help="Each selected industry appears as a tag.",
+                    key="edit_industry",
                 )
             with company_row1[1]:
                 edit_company_size = st.multiselect("Company Size", COMPANY_SIZE_OPTIONS, default=saved_sizes, placeholder="Select company size", key="edit_company_size")
@@ -2278,17 +2295,20 @@ def show_edit_campaign_dialog(campaign_id):
                 edit_company_city = st.multiselect(
                     "City", options=[], default=split_clay_values(campaign.get("company_city", "")),
                     accept_new_options=True, placeholder="Add cities", help="Optional company-headquarters location filter.",
+                    key="edit_company_city",
                 )
             with company_row2[1]:
                 edit_company_state = st.multiselect(
                     "State / Region", options=[], default=split_clay_values(campaign.get("company_state", "")),
                     accept_new_options=True, placeholder="Add states or regions", help="Optional company-headquarters location filter.",
+                    key="edit_company_state",
                 )
             with company_row2[2]:
                 edit_current_cms = st.multiselect(
                     "Current CMS", options=[], default=split_clay_values(campaign.get("current_cms", "")),
                     accept_new_options=True, placeholder="Add CMS platforms",
                     help="Optional research note. Each platform appears as a tag; enrichment is done in Clay after review.",
+                    key="edit_current_cms",
                 )
 
         with st.container(border=True):
@@ -2299,11 +2319,13 @@ def show_edit_campaign_dialog(campaign_id):
                 edit_target_titles = st.multiselect(
                     "Job Title", options=[], default=split_clay_values(campaign.get("target_titles", "")),
                     accept_new_options=True, placeholder="Add target job titles", help="Each selected job title appears as a tag.",
+                    key="edit_target_titles",
                 )
             with contact_row1[1]:
                 edit_department = st.multiselect(
                     "Department", options=[], default=split_clay_values(campaign.get("department", "")),
                     accept_new_options=True, placeholder="Add departments", help="Each selected department appears as a tag.",
+                    key="edit_department",
                 )
             contact_row2 = st.columns(3, gap="large")
             with contact_row2[0]:
@@ -2438,27 +2460,27 @@ def show_create_campaign_dialog():
             st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             company_row1 = st.columns(3, gap="large")
             with company_row1[0]:
-                industry = st.multiselect("Industry", options=[], default=[], accept_new_options=True, placeholder="Add or select industries", help="Each selected industry appears as a tag.")
+                industry = st.multiselect("Industry", options=[], default=[], accept_new_options=True, placeholder="Add or select industries", help="Each selected industry appears as a tag.", key="create_industry")
             with company_row1[1]:
                 company_size = st.multiselect("Company Size", COMPANY_SIZE_OPTIONS, default=[], placeholder="Select company size", key="create_company_size")
             with company_row1[2]:
                 company_country = st.multiselect("Company Country", options=COUNTRY_OPTIONS, default=[], accept_new_options=True, placeholder="Select countries", help="Select multiple countries; each appears as a tag.", key="create_company_country")
             company_row2 = st.columns(3, gap="large")
             with company_row2[0]:
-                company_city = st.multiselect("City", options=[], default=[], accept_new_options=True, placeholder="Add cities", help="Optional company-headquarters location filter.")
+                company_city = st.multiselect("City", options=[], default=[], accept_new_options=True, placeholder="Add cities", help="Optional company-headquarters location filter.", key="create_company_city")
             with company_row2[1]:
-                company_state = st.multiselect("State / Region", options=[], default=[], accept_new_options=True, placeholder="Add states or regions", help="Optional company-headquarters location filter.")
+                company_state = st.multiselect("State / Region", options=[], default=[], accept_new_options=True, placeholder="Add states or regions", help="Optional company-headquarters location filter.", key="create_company_state")
             with company_row2[2]:
-                current_cms = st.multiselect("Current CMS", options=[], default=[], accept_new_options=True, placeholder="Add CMS platforms", help="Optional research note. Each platform appears as a tag.")
+                current_cms = st.multiselect("Current CMS", options=[], default=[], accept_new_options=True, placeholder="Add CMS platforms", help="Optional research note. Each platform appears as a tag.", key="create_current_cms")
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">2. Contacts <small>Define the contact criteria to find the right people from selected companies.</small></div>', unsafe_allow_html=True)
             st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             contact_row1 = st.columns(2, gap="large")
             with contact_row1[0]:
-                target_titles = st.multiselect("Job Title", options=[], default=[], accept_new_options=True, placeholder="Add target job titles", help="Each selected job title appears as a tag.")
+                target_titles = st.multiselect("Job Title", options=[], default=[], accept_new_options=True, placeholder="Add target job titles", help="Each selected job title appears as a tag.", key="create_target_titles")
             with contact_row1[1]:
-                department = st.multiselect("Department", options=[], default=[], accept_new_options=True, placeholder="Add departments", help="Each selected department appears as a tag.")
+                department = st.multiselect("Department", options=[], default=[], accept_new_options=True, placeholder="Add departments", help="Each selected department appears as a tag.", key="create_department")
             contact_row2 = st.columns(3, gap="large")
             with contact_row2[0]:
                 seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=[], placeholder="Select seniority levels", key="create_seniority")
