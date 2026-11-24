@@ -142,37 +142,98 @@ st.markdown(
         border: 1px solid #d1d5db !important;
     }
 
-    /* Free-entry tag fields: hide the native select chevron SVG itself.
-       The previous selectors missed the actual BaseWeb indicator in this Streamlit render.
-       Keep selected-value remove icons visible by restoring SVGs inside BaseWeb tags. */
-    .st-key-create_industry [data-baseweb="select"] svg,
-    .st-key-create_company_city [data-baseweb="select"] svg,
-    .st-key-create_company_state [data-baseweb="select"] svg,
-    .st-key-create_current_cms [data-baseweb="select"] svg,
-    .st-key-create_target_titles [data-baseweb="select"] svg,
-    .st-key-create_department [data-baseweb="select"] svg,
-    .st-key-edit_industry [data-baseweb="select"] svg,
-    .st-key-edit_company_city [data-baseweb="select"] svg,
-    .st-key-edit_company_state [data-baseweb="select"] svg,
-    .st-key-edit_current_cms [data-baseweb="select"] svg,
-    .st-key-edit_target_titles [data-baseweb="select"] svg,
-    .st-key-edit_department [data-baseweb="select"] svg {
+    /* Free-entry multi-selects: suppress only the trailing dropdown indicator.
+       Scope is limited to the six free-entry fields in Create and Edit Campaign.
+       Predefined-value filters are intentionally not included. */
+    div.st-key-create_industry [data-baseweb="select"] > div:last-child,
+    div.st-key-create_industry [data-baseweb="select"] > div > div:last-child,
+    div.st-key-create_industry [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-create_industry [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-create_industry [data-baseweb="select"]::after,
+    div.st-key-create_company_city [data-baseweb="select"] > div:last-child,
+    div.st-key-create_company_city [data-baseweb="select"] > div > div:last-child,
+    div.st-key-create_company_city [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-create_company_city [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-create_company_city [data-baseweb="select"]::after,
+    div.st-key-create_company_state [data-baseweb="select"] > div:last-child,
+    div.st-key-create_company_state [data-baseweb="select"] > div > div:last-child,
+    div.st-key-create_company_state [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-create_company_state [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-create_company_state [data-baseweb="select"]::after,
+    div.st-key-create_current_cms [data-baseweb="select"] > div:last-child,
+    div.st-key-create_current_cms [data-baseweb="select"] > div > div:last-child,
+    div.st-key-create_current_cms [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-create_current_cms [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-create_current_cms [data-baseweb="select"]::after,
+    div.st-key-create_target_titles [data-baseweb="select"] > div:last-child,
+    div.st-key-create_target_titles [data-baseweb="select"] > div > div:last-child,
+    div.st-key-create_target_titles [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-create_target_titles [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-create_target_titles [data-baseweb="select"]::after,
+    div.st-key-create_department [data-baseweb="select"] > div:last-child,
+    div.st-key-create_department [data-baseweb="select"] > div > div:last-child,
+    div.st-key-create_department [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-create_department [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-create_department [data-baseweb="select"]::after,
+    div.st-key-edit_industry [data-baseweb="select"] > div:last-child,
+    div.st-key-edit_industry [data-baseweb="select"] > div > div:last-child,
+    div.st-key-edit_industry [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-edit_industry [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-edit_industry [data-baseweb="select"]::after,
+    div.st-key-edit_company_city [data-baseweb="select"] > div:last-child,
+    div.st-key-edit_company_city [data-baseweb="select"] > div > div:last-child,
+    div.st-key-edit_company_city [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-edit_company_city [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-edit_company_city [data-baseweb="select"]::after,
+    div.st-key-edit_company_state [data-baseweb="select"] > div:last-child,
+    div.st-key-edit_company_state [data-baseweb="select"] > div > div:last-child,
+    div.st-key-edit_company_state [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-edit_company_state [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-edit_company_state [data-baseweb="select"]::after,
+    div.st-key-edit_current_cms [data-baseweb="select"] > div:last-child,
+    div.st-key-edit_current_cms [data-baseweb="select"] > div > div:last-child,
+    div.st-key-edit_current_cms [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-edit_current_cms [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-edit_current_cms [data-baseweb="select"]::after,
+    div.st-key-edit_target_titles [data-baseweb="select"] > div:last-child,
+    div.st-key-edit_target_titles [data-baseweb="select"] > div > div:last-child,
+    div.st-key-edit_target_titles [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-edit_target_titles [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-edit_target_titles [data-baseweb="select"]::after,
+    div.st-key-edit_department [data-baseweb="select"] > div:last-child,
+    div.st-key-edit_department [data-baseweb="select"] > div > div:last-child,
+    div.st-key-edit_department [data-baseweb="select"] [aria-hidden="true"],
+    div.st-key-edit_department [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
+    div.st-key-edit_department [data-baseweb="select"]::after {
         display: none !important;
+        visibility: hidden !important;
+        opacity: 0 !important;
+        width: 0 !important;
+        min-width: 0 !important;
+        max-width: 0 !important;
+        padding: 0 !important;
+        margin: 0 !important;
+        pointer-events: none !important;
     }
-    .st-key-create_industry [data-baseweb="tag"] svg,
-    .st-key-create_company_city [data-baseweb="tag"] svg,
-    .st-key-create_company_state [data-baseweb="tag"] svg,
-    .st-key-create_current_cms [data-baseweb="tag"] svg,
-    .st-key-create_target_titles [data-baseweb="tag"] svg,
-    .st-key-create_department [data-baseweb="tag"] svg,
-    .st-key-edit_industry [data-baseweb="tag"] svg,
-    .st-key-edit_company_city [data-baseweb="tag"] svg,
-    .st-key-edit_company_state [data-baseweb="tag"] svg,
-    .st-key-edit_current_cms [data-baseweb="tag"] svg,
-    .st-key-edit_target_titles [data-baseweb="tag"] svg,
-    .st-key-edit_department [data-baseweb="tag"] svg {
+    /* Preserve remove icons on any selected tags in these fields. */
+    div.st-key-create_industry [data-baseweb="tag"] svg,
+    div.st-key-create_company_city [data-baseweb="tag"] svg,
+    div.st-key-create_company_state [data-baseweb="tag"] svg,
+    div.st-key-create_current_cms [data-baseweb="tag"] svg,
+    div.st-key-create_target_titles [data-baseweb="tag"] svg,
+    div.st-key-create_department [data-baseweb="tag"] svg,
+    div.st-key-edit_industry [data-baseweb="tag"] svg,
+    div.st-key-edit_company_city [data-baseweb="tag"] svg,
+    div.st-key-edit_company_state [data-baseweb="tag"] svg,
+    div.st-key-edit_current_cms [data-baseweb="tag"] svg,
+    div.st-key-edit_target_titles [data-baseweb="tag"] svg,
+    div.st-key-edit_department [data-baseweb="tag"] svg {
         display: inline-block !important;
         visibility: visible !important;
+        opacity: 1 !important;
+        width: auto !important;
+        max-width: none !important;
+        pointer-events: auto !important;
     }
 
     div[role="dialog"] [data-testid="stMultiSelect"] [data-baseweb="select"] span {
