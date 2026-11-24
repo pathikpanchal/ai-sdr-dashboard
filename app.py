@@ -60,8 +60,13 @@ st.markdown(
 
     /* Compact, content-sized Create Campaign action. */
     div[role="dialog"] {
-        width: min(1500px, 98vw) !important;
+        width: min(1680px, 98vw) !important;
         max-width: 98vw !important;
+    }
+    @media (min-width: 1200px) {
+        div[role="dialog"] [data-testid="stForm"] {
+            max-width: none !important;
+        }
     }
     div[role="dialog"] [data-testid="stVerticalBlock"] > div {
         min-width: 0;
@@ -384,6 +389,8 @@ def get_connection():
     migrations = {
         "campaigns": {
             "current_cms": "TEXT DEFAULT ''",
+            "company_state": "TEXT DEFAULT ''",
+            "company_city": "TEXT DEFAULT ''",
             "company_size": "TEXT DEFAULT ''",
             "department": "TEXT DEFAULT ''",
             "seniority": "TEXT DEFAULT 'Manager'",
@@ -716,6 +723,15 @@ def get_clay_search_result_cap():
     return max(1, min(configured, 500))
 
 
+def join_tag_values(values):
+    """Store Streamlit tag selections in the existing comma-separated campaign fields."""
+    if isinstance(values, (list, tuple, set)):
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+    else:
+        cleaned = split_clay_values(values)
+    return ", ".join(dict.fromkeys(cleaned))
+
+
 def split_clay_values(query):
     """Split comma/semicolon/newline values without changing their original casing."""
     raw = str(query or "").replace(";", ",").replace("\n", ",")
@@ -845,6 +861,13 @@ def build_clay_company_query(campaign):
             f"country_name = {clay_quote(country)}" for country in canonical_countries
         )
         clauses.append(f"locations.any({country_clause})")
+
+    states = split_clay_values(campaign.get("company_state", ""))
+    if states:
+        clauses.append("state_name in (" + ", ".join(clay_quote(v) for v in states) + ")")
+    cities = split_clay_values(campaign.get("company_city", ""))
+    if cities:
+        clauses.append("city_name in (" + ", ".join(clay_quote(v) for v in cities) + ")")
 
     if not clauses:
         raise ValueError(
@@ -1031,6 +1054,23 @@ def run_clay_company_search(campaign, campaign_id, api_key):
         filters["country_names"] = country_values
         if "location_headquarters_only" in schema:
             filters["location_headquarters_only"] = True
+
+    state_values = split_clay_values(campaign.get("company_state", ""))
+    if state_values:
+        state_field_name = next((name for name in ("location_states_include", "state_names", "states", "location_states", "location_state_names") if name in schema), None)
+        if not state_field_name:
+            raise RuntimeError("Clay's current company-search schema does not expose a state filter. The dashboard stopped rather than ignoring your selected state(s).")
+        filters[state_field_name] = _clay_filter_values(schema[state_field_name], state_values, "Company State")
+
+    city_values = split_clay_values(campaign.get("company_city", ""))
+    if city_values:
+        city_field_name = next((name for name in ("location_cities_include", "city_names", "cities", "location_cities", "location_city_names") if name in schema), None)
+        if not city_field_name:
+            raise RuntimeError("Clay's current company-search schema does not expose a city filter. The dashboard stopped rather than ignoring your selected city/cities.")
+        filters[city_field_name] = _clay_filter_values(schema[city_field_name], city_values, "Company City")
+
+    if (state_values or city_values) and "location_headquarters_only" in schema:
+        filters["location_headquarters_only"] = True
 
     company_size_labels = split_clay_values(campaign.get("company_size", ""))
     if company_size_labels:
@@ -1283,7 +1323,7 @@ def _expand_seniority_for_job_level(campaign):
     # Current Create/Edit forms use exact selected levels. Keep the previous
     # Above/Below behaviour only for legacy campaign records that still carry it.
     level = str(campaign.get("job_level", "Exact") or "Exact").strip().casefold()
-    if level in ("", "any", "exact"):
+    if level in ("", "any", "exact", "equal"):
         return [] if level == "any" else selected_values
 
     rank_groups = [
@@ -2137,10 +2177,10 @@ def show_edit_campaign_dialog(campaign_id):
                 st.caption("Filter the companies you want to target.")
                 company_row1 = st.columns(2)
                 with company_row1[0]:
-                    edit_industry = st.text_area(
-                        "Industry", value=str(campaign.get("industry") or ""), height=68,
-                        placeholder="e.g., Pharmaceuticals, Retail",
-                        help="Enter multiple industries separated by commas or new lines.",
+                    edit_industry = st.multiselect(
+                        "Industry", options=[], default=split_clay_values(campaign.get("industry", "")),
+                        accept_new_options=True, placeholder="Add or select industries",
+                        help="Each selected industry appears as a tag.",
                     )
                 with company_row1[1]:
                     edit_company_size = st.multiselect(
@@ -2149,16 +2189,29 @@ def show_edit_campaign_dialog(campaign_id):
                     )
                 company_row2 = st.columns(2)
                 with company_row2[0]:
-                    edit_company_country = st.text_area(
-                        "Company Country", value=str(campaign.get("company_country") or ""), height=68,
-                        placeholder="e.g., United Kingdom",
-                        help="Enter multiple countries separated by commas or new lines.",
+                    edit_company_country = st.multiselect(
+                        "Company Country", options=[], default=split_clay_values(campaign.get("company_country", "")),
+                        accept_new_options=True, placeholder="Add or select countries",
+                        help="Select multiple countries; each country appears as a tag.",
                     )
                 with company_row2[1]:
-                    edit_current_cms = st.text_area(
-                        "Current CMS", value=str(campaign.get("current_cms") or ""), height=68,
-                        placeholder="e.g., WordPress, Drupal, Sitecore",
-                        help="Optional research note. Enter multiple platforms separated by commas or new lines. Sales can enrich Current CMS in Clay after reviewing the company list.",
+                    edit_current_cms = st.multiselect(
+                        "Current CMS", options=[], default=split_clay_values(campaign.get("current_cms", "")),
+                        accept_new_options=True, placeholder="Add CMS platforms",
+                        help="Optional research note. Each platform appears as a tag; enrichment is done in Clay after review.",
+                    )
+                company_row3 = st.columns(2)
+                with company_row3[0]:
+                    edit_company_state = st.multiselect(
+                        "State / Region", options=[], default=split_clay_values(campaign.get("company_state", "")),
+                        accept_new_options=True, placeholder="Add states or regions",
+                        help="Optional location filter for company headquarters.",
+                    )
+                with company_row3[1]:
+                    edit_company_city = st.multiselect(
+                        "City", options=[], default=split_clay_values(campaign.get("company_city", "")),
+                        accept_new_options=True, placeholder="Add cities",
+                        help="Optional location filter for company headquarters.",
                     )
 
         with contact_col:
@@ -2167,16 +2220,16 @@ def show_edit_campaign_dialog(campaign_id):
                 st.caption("Define the right contacts at those companies.")
                 contact_row1 = st.columns(2)
                 with contact_row1[0]:
-                    edit_target_titles = st.text_area(
-                        "Job Title", value=str(campaign.get("target_titles") or ""), height=68,
-                        placeholder="e.g., Marketing Director, Head of Growth",
-                        help="Enter multiple job titles separated by commas or new lines.",
+                    edit_target_titles = st.multiselect(
+                        "Job Title", options=[], default=split_clay_values(campaign.get("target_titles", "")),
+                        accept_new_options=True, placeholder="Add target job titles",
+                        help="Each selected job title appears as a tag.",
                     )
                 with contact_row1[1]:
-                    edit_department = st.text_area(
-                        "Department", value=str(campaign.get("department") or ""), height=68,
-                        placeholder="e.g., Marketing, Sales",
-                        help="Enter multiple departments separated by commas or new lines.",
+                    edit_department = st.multiselect(
+                        "Department", options=[], default=split_clay_values(campaign.get("department", "")),
+                        accept_new_options=True, placeholder="Add departments",
+                        help="Each selected department appears as a tag.",
                     )
                 contact_row2 = st.columns(2)
                 with contact_row2[0]:
@@ -2185,11 +2238,16 @@ def show_edit_campaign_dialog(campaign_id):
                         placeholder="Select seniority levels",
                     )
                 with contact_row2[1]:
-                    edit_contact_country = st.text_area(
-                        "Contact Country", value=str(campaign.get("contact_country") or ""), height=68,
-                        placeholder="e.g., United Kingdom",
-                        help="Enter multiple countries separated by commas or new lines. Based on the person's location, not the company's headquarters.",
+                    edit_contact_country = st.multiselect(
+                        "Contact Country", options=[], default=split_clay_values(campaign.get("contact_country", "")),
+                        accept_new_options=True, placeholder="Add or select countries",
+                        help="Each selected country appears as a tag. Based on the person's location, not company headquarters.",
                     )
+                edit_job_level = st.selectbox(
+                    "Job Level", ["Below", "Above", "Equal"],
+                    index={"below": 0, "above": 1, "exact": 2, "equal": 2}.get(str(campaign.get("job_level", "Equal") or "Equal").casefold(), 2),
+                    help="Compare the selected Seniority level(s) using this rule. Equal means an exact seniority match.",
+                )
 
         with st.expander("🗂️ Clay Details", expanded=True):
             st.caption("Optional: add the workbook and webhook destinations now, or save the campaign and configure them later.")
@@ -2231,20 +2289,22 @@ def show_edit_campaign_dialog(campaign_id):
     if save_changes:
         if not edit_name.strip() or not edit_owner.strip():
             st.error("Please enter both Campaign Name and Campaign Owner.")
-        elif not split_clay_values(edit_industry) and not split_clay_values(edit_company_country) and not edit_company_size:
+        elif not edit_industry and not edit_company_country and not edit_company_state and not edit_company_city and not edit_company_size:
             st.error("Add at least one company filter: Industry, Company Size, or Company Country.")
         else:
             owner_value = edit_owner.strip()
             original_campaign = campaign_as_dict(campaign_id) or {}
             search_criteria_fields = {
-                "industry": edit_industry.strip(),
-                "company_country": edit_company_country.strip(),
+                "industry": join_tag_values(edit_industry),
+                "company_country": join_tag_values(edit_company_country),
+                "company_state": join_tag_values(edit_company_state),
+                "company_city": join_tag_values(edit_company_city),
                 "company_size": ", ".join(edit_company_size),
-                "contact_country": edit_contact_country.strip(),
-                "target_titles": edit_target_titles.strip(),
-                "department": edit_department.strip(),
+                "contact_country": join_tag_values(edit_contact_country),
+                "target_titles": join_tag_values(edit_target_titles),
+                "department": join_tag_values(edit_department),
                 "seniority": ", ".join(edit_seniority),
-                "job_level": "Exact",
+                "job_level": edit_job_level,
             }
             criteria_changed = any(
                 str(original_campaign.get(field, "") or "").strip() != str(value or "").strip()
@@ -2252,15 +2312,16 @@ def show_edit_campaign_dialog(campaign_id):
             )
             conn.execute(
                 """UPDATE campaigns
-                   SET name = ?, campaign_owner = ?, industry = ?, company_country = ?, company_size = ?,
+                   SET name = ?, campaign_owner = ?, industry = ?, company_country = ?, company_state = ?, company_city = ?, company_size = ?,
                        contact_country = ?, target_titles = ?, current_cms = ?, department = ?, seniority = ?,
                        job_level = ?, clay_table_url = ?, clay_companies_webhook_url = ?, clay_contacts_webhook_url = ?,
                        clay_companies_webhook_auth = ?, clay_contacts_webhook_auth = ?
                    WHERE id = ?""",
                 (
-                    edit_name.strip(), owner_value, edit_industry.strip(), edit_company_country.strip(),
-                    ", ".join(edit_company_size), edit_contact_country.strip(), edit_target_titles.strip(),
-                    edit_current_cms.strip(), edit_department.strip(), ", ".join(edit_seniority), "Exact",
+                    edit_name.strip(), owner_value, join_tag_values(edit_industry), join_tag_values(edit_company_country),
+                    join_tag_values(edit_company_state), join_tag_values(edit_company_city), ", ".join(edit_company_size),
+                    join_tag_values(edit_contact_country), join_tag_values(edit_target_titles),
+                    join_tag_values(edit_current_cms), join_tag_values(edit_department), ", ".join(edit_seniority), edit_job_level,
                     edit_clay_table_url.strip(), edit_companies_webhook.strip(), edit_contacts_webhook.strip(),
                     edit_companies_webhook_auth.strip(), edit_contacts_webhook_auth.strip(), campaign_id,
                 ),
@@ -2319,9 +2380,9 @@ def show_create_campaign_dialog():
                 st.caption("Filter the companies you want to target.")
                 company_row1 = st.columns(2)
                 with company_row1[0]:
-                    industry = st.text_area(
-                        "Industry", height=68, placeholder="e.g., Pharmaceuticals, Retail",
-                        help="Enter multiple industries separated by commas or new lines.",
+                    industry = st.multiselect(
+                        "Industry", options=[], default=[], accept_new_options=True,
+                        placeholder="Add or select industries", help="Each selected industry appears as a tag.",
                     )
                 with company_row1[1]:
                     company_size = st.multiselect(
@@ -2330,14 +2391,25 @@ def show_create_campaign_dialog():
                     )
                 company_row2 = st.columns(2)
                 with company_row2[0]:
-                    company_country = st.text_area(
-                        "Company Country", height=68, placeholder="e.g., United Kingdom",
-                        help="Enter multiple countries separated by commas or new lines.",
+                    company_country = st.multiselect(
+                        "Company Country", options=[], default=[], accept_new_options=True,
+                        placeholder="Add or select countries", help="Each selected country appears as a tag.",
                     )
                 with company_row2[1]:
-                    current_cms = st.text_area(
-                        "Current CMS", height=68, placeholder="e.g., WordPress, Drupal, Sitecore",
-                        help="Optional research note. Enter multiple platforms separated by commas or new lines. Sales can enrich Current CMS in Clay after reviewing the company list.",
+                    current_cms = st.multiselect(
+                        "Current CMS", options=[], default=[], accept_new_options=True,
+                        placeholder="Add CMS platforms", help="Optional research note. Each platform appears as a tag.",
+                    )
+                company_row3 = st.columns(2)
+                with company_row3[0]:
+                    company_state = st.multiselect(
+                        "State / Region", options=[], default=[], accept_new_options=True,
+                        placeholder="Add states or regions", help="Optional company-headquarters location filter.",
+                    )
+                with company_row3[1]:
+                    company_city = st.multiselect(
+                        "City", options=[], default=[], accept_new_options=True,
+                        placeholder="Add cities", help="Optional company-headquarters location filter.",
                     )
 
         with contact_col:
@@ -2346,14 +2418,14 @@ def show_create_campaign_dialog():
                 st.caption("Define the right contacts at those companies.")
                 contact_row1 = st.columns(2)
                 with contact_row1[0]:
-                    target_titles = st.text_area(
-                        "Job Title", height=68, placeholder="e.g., Marketing Director, Head of Growth",
-                        help="Enter multiple job titles separated by commas or new lines.",
+                    target_titles = st.multiselect(
+                        "Job Title", options=[], default=[], accept_new_options=True,
+                        placeholder="Add target job titles", help="Each selected job title appears as a tag.",
                     )
                 with contact_row1[1]:
-                    department = st.text_area(
-                        "Department", height=68, placeholder="e.g., Marketing, Sales",
-                        help="Enter multiple departments separated by commas or new lines.",
+                    department = st.multiselect(
+                        "Department", options=[], default=[], accept_new_options=True,
+                        placeholder="Add departments", help="Each selected department appears as a tag.",
                     )
                 contact_row2 = st.columns(2)
                 with contact_row2[0]:
@@ -2362,10 +2434,14 @@ def show_create_campaign_dialog():
                         placeholder="Select seniority levels",
                     )
                 with contact_row2[1]:
-                    contact_country = st.text_area(
-                        "Contact Country", height=68, placeholder="e.g., United Kingdom",
-                        help="Enter multiple countries separated by commas or new lines.",
+                    contact_country = st.multiselect(
+                        "Contact Country", options=[], default=[], accept_new_options=True,
+                        placeholder="Add or select countries", help="Each selected country appears as a tag.",
                     )
+                job_level = st.selectbox(
+                    "Job Level", ["Below", "Above", "Equal"], index=2,
+                    help="Compare the selected Seniority level(s) using this rule. Equal means an exact seniority match.",
+                )
 
         with st.expander("🗂️ Clay Details", expanded=True):
             st.caption("Optional: add the workbook and webhook destinations now, or save the campaign and configure them later.")
@@ -2402,24 +2478,25 @@ def show_create_campaign_dialog():
     if submitted:
         if not campaign_name.strip() or not campaign_owner.strip():
             st.error("Please complete both required fields: Campaign Name and Campaign Owner.")
-        elif not split_clay_values(industry) and not split_clay_values(company_country) and not company_size:
+        elif not industry and not company_country and not company_state and not company_city and not company_size:
             st.error("Add at least one company filter: Industry, Company Size, or Company Country.")
         else:
             campaign_id = str(uuid.uuid4())
             owner_value = campaign_owner.strip()
             conn.execute(
                 """INSERT INTO campaigns
-                   (id, name, industry, company_country, company_size, contact_country, target_titles,
+                   (id, name, industry, company_country, company_state, company_city, company_size, contact_country, target_titles,
                     min_score, status, created_at, current_cms, department, seniority, job_level,
                     email_sequence_instructions, clay_table_url, campaign_owner,
                     clay_companies_webhook_url, clay_contacts_webhook_url,
                     clay_companies_webhook_auth, clay_contacts_webhook_auth)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    campaign_id, campaign_name.strip(), industry.strip(), company_country.strip(),
-                    ", ".join(company_size), contact_country.strip(), target_titles.strip(),
-                    0, "Draft", datetime.now().isoformat(timespec="seconds"), current_cms.strip(),
-                    department.strip(), ", ".join(seniority), "Exact", "", clay_table_url.strip(),
+                    campaign_id, campaign_name.strip(), join_tag_values(industry), join_tag_values(company_country),
+                    join_tag_values(company_state), join_tag_values(company_city), ", ".join(company_size),
+                    join_tag_values(contact_country), join_tag_values(target_titles),
+                    0, "Draft", datetime.now().isoformat(timespec="seconds"), join_tag_values(current_cms),
+                    join_tag_values(department), ", ".join(seniority), job_level, "", clay_table_url.strip(),
                     owner_value, clay_companies_webhook_url.strip(), clay_contacts_webhook_url.strip(),
                     clay_companies_webhook_auth.strip(), clay_contacts_webhook_auth.strip(),
                 ),
@@ -2776,16 +2853,18 @@ if active_page == "Campaigns":
                             conn.execute(
                                 """
                                 INSERT INTO campaigns
-                                (id, name, industry, company_country, company_size, contact_country, target_titles,
+                                (id, name, industry, company_country, company_state, company_city, company_size, contact_country, target_titles,
                                  min_score, status, created_at, current_cms, department, seniority,
                                  job_level, email_sequence_instructions, clay_table_url, campaign_owner)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     new_id,
                                     new_name,
                                     source_campaign.get("industry", "") or "",
                                     source_campaign.get("company_country", "") or "",
+                                    source_campaign.get("company_state", "") or "",
+                                    source_campaign.get("company_city", "") or "",
                                     source_campaign.get("company_size", "") or "",
                                     source_campaign.get("contact_country", "") or "",
                                     source_campaign.get("target_titles", "") or "",
@@ -2900,6 +2979,7 @@ if active_page == "Campaigns":
                     criteria_cols = st.columns(3)
                     criteria_cols[0].write(f"**Industry**\n\n{selected_row['industry'] or 'Any'}")
                     criteria_cols[1].write(f"**Company Country**\n\n{selected_row['company_country'] or 'Any'}")
+                    st.caption(f"Company State / Region: {selected_row.get('company_state', '') or 'Any'} · Company City: {selected_row.get('company_city', '') or 'Any'}")
                     criteria_cols[2].write(f"**Company Size**\n\n{selected_row.get('company_size', '') or 'Any'}")
                     criteria_cols = st.columns(3)
                     criteria_cols[0].write(f"**Contact Country**\n\n{selected_row['contact_country'] or 'Any'}")
