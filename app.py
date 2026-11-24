@@ -3515,7 +3515,7 @@ elif active_page == "Settings":
             if st.button("Test Connection", disabled=not bool(current_key), key="test_clay_connection"):
                 try:
                     response = requests.get(
-                        "https://api.clay.com/public/v0/search/filters-mode/fields",
+                        "https://api.clay.com/public/v0/me",
                         headers={"clay-api-key": current_key},
                         timeout=20,
                     )
