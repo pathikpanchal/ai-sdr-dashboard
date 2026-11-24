@@ -142,80 +142,26 @@ st.markdown(
         border: 1px solid #d1d5db !important;
     }
 
-    /* Free-entry multi-selects: suppress only the trailing dropdown indicator.
-       Scope is limited to the six free-entry fields in Create and Edit Campaign.
-       Predefined-value filters are intentionally not included. */
-    div.st-key-create_industry [data-baseweb="select"] > div:last-child,
-    div.st-key-create_industry [data-baseweb="select"] > div > div:last-child,
-    div.st-key-create_industry [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-create_industry [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-create_industry [data-baseweb="select"]::after,
-    div.st-key-create_company_city [data-baseweb="select"] > div:last-child,
-    div.st-key-create_company_city [data-baseweb="select"] > div > div:last-child,
-    div.st-key-create_company_city [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-create_company_city [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-create_company_city [data-baseweb="select"]::after,
-    div.st-key-create_company_state [data-baseweb="select"] > div:last-child,
-    div.st-key-create_company_state [data-baseweb="select"] > div > div:last-child,
-    div.st-key-create_company_state [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-create_company_state [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-create_company_state [data-baseweb="select"]::after,
-    div.st-key-create_current_cms [data-baseweb="select"] > div:last-child,
-    div.st-key-create_current_cms [data-baseweb="select"] > div > div:last-child,
-    div.st-key-create_current_cms [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-create_current_cms [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-create_current_cms [data-baseweb="select"]::after,
-    div.st-key-create_target_titles [data-baseweb="select"] > div:last-child,
-    div.st-key-create_target_titles [data-baseweb="select"] > div > div:last-child,
-    div.st-key-create_target_titles [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-create_target_titles [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-create_target_titles [data-baseweb="select"]::after,
-    div.st-key-create_department [data-baseweb="select"] > div:last-child,
-    div.st-key-create_department [data-baseweb="select"] > div > div:last-child,
-    div.st-key-create_department [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-create_department [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-create_department [data-baseweb="select"]::after,
-    div.st-key-edit_industry [data-baseweb="select"] > div:last-child,
-    div.st-key-edit_industry [data-baseweb="select"] > div > div:last-child,
-    div.st-key-edit_industry [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-edit_industry [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-edit_industry [data-baseweb="select"]::after,
-    div.st-key-edit_company_city [data-baseweb="select"] > div:last-child,
-    div.st-key-edit_company_city [data-baseweb="select"] > div > div:last-child,
-    div.st-key-edit_company_city [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-edit_company_city [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-edit_company_city [data-baseweb="select"]::after,
-    div.st-key-edit_company_state [data-baseweb="select"] > div:last-child,
-    div.st-key-edit_company_state [data-baseweb="select"] > div > div:last-child,
-    div.st-key-edit_company_state [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-edit_company_state [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-edit_company_state [data-baseweb="select"]::after,
-    div.st-key-edit_current_cms [data-baseweb="select"] > div:last-child,
-    div.st-key-edit_current_cms [data-baseweb="select"] > div > div:last-child,
-    div.st-key-edit_current_cms [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-edit_current_cms [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-edit_current_cms [data-baseweb="select"]::after,
-    div.st-key-edit_target_titles [data-baseweb="select"] > div:last-child,
-    div.st-key-edit_target_titles [data-baseweb="select"] > div > div:last-child,
-    div.st-key-edit_target_titles [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-edit_target_titles [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-edit_target_titles [data-baseweb="select"]::after,
-    div.st-key-edit_department [data-baseweb="select"] > div:last-child,
-    div.st-key-edit_department [data-baseweb="select"] > div > div:last-child,
-    div.st-key-edit_department [data-baseweb="select"] [aria-hidden="true"],
-    div.st-key-edit_department [data-baseweb="select"] svg:not([data-baseweb="tag"] svg),
-    div.st-key-edit_department [data-baseweb="select"]::after {
+    /* Free-entry fields only: hide the select chevron SVG itself.
+       This avoids relying on BaseWeb's changing internal indicator-wrapper markup.
+       Tag close/remove icons are explicitly restored below. */
+    div.st-key-create_industry [data-baseweb="select"] svg,
+    div.st-key-create_company_city [data-baseweb="select"] svg,
+    div.st-key-create_company_state [data-baseweb="select"] svg,
+    div.st-key-create_current_cms [data-baseweb="select"] svg,
+    div.st-key-create_target_titles [data-baseweb="select"] svg,
+    div.st-key-create_department [data-baseweb="select"] svg,
+    div.st-key-edit_industry [data-baseweb="select"] svg,
+    div.st-key-edit_company_city [data-baseweb="select"] svg,
+    div.st-key-edit_company_state [data-baseweb="select"] svg,
+    div.st-key-edit_current_cms [data-baseweb="select"] svg,
+    div.st-key-edit_target_titles [data-baseweb="select"] svg,
+    div.st-key-edit_department [data-baseweb="select"] svg {
         display: none !important;
         visibility: hidden !important;
         opacity: 0 !important;
-        width: 0 !important;
-        min-width: 0 !important;
-        max-width: 0 !important;
-        padding: 0 !important;
-        margin: 0 !important;
-        pointer-events: none !important;
     }
-    /* Preserve remove icons on any selected tags in these fields. */
+    /* Keep the × remove icon visible on selected tags in those same fields. */
     div.st-key-create_industry [data-baseweb="tag"] svg,
     div.st-key-create_company_city [data-baseweb="tag"] svg,
     div.st-key-create_company_state [data-baseweb="tag"] svg,
@@ -231,9 +177,6 @@ st.markdown(
         display: inline-block !important;
         visibility: visible !important;
         opacity: 1 !important;
-        width: auto !important;
-        max-width: none !important;
-        pointer-events: auto !important;
     }
 
     div[role="dialog"] [data-testid="stMultiSelect"] [data-baseweb="select"] span {
