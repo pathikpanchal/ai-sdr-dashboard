@@ -78,22 +78,34 @@ st.markdown(
         margin-top: 0.15rem;
         margin-bottom: 0.55rem;
     }
-    div[role="dialog"] .campaign-section-header {
-        background: #dbeafe;
-        color: #1e3a8a;
-        border: 1px solid #bfdbfe;
+    /* Campaign form section styling. Keep selectors global because Streamlit
+       renders dialog content through different wrapper elements across versions. */
+    .campaign-section-header {
+        background: #dbeafe !important;
+        color: #1e3a8a !important;
+        border: 1px solid #bfdbfe !important;
         border-radius: 9px;
         padding: 0.68rem 0.9rem;
-        /* Consistent breathing room between every section heading and its fields. */
-        margin: 0.1rem 0 1.35rem 0;
+        margin: 0 !important;
         font-size: 1.08rem;
         font-weight: 700;
+        line-height: 1.45;
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
     }
-    div[role="dialog"] .campaign-section-header small {
-        color: #111827;
+    .campaign-section-header small {
+        color: #111827 !important;
         font-size: 0.84rem;
         font-weight: 400;
         margin-left: 0.6rem;
+    }
+    /* Explicit spacer guarantees the same gap below all four section headers. */
+    .campaign-section-spacer {
+        display: block;
+        height: 1.15rem;
+        min-height: 1.15rem;
+        width: 100%;
     }
     div[role="dialog"] button[kind="primaryFormSubmit"],
     div[role="dialog"] button[kind="primary"] {
@@ -2206,6 +2218,7 @@ def show_edit_campaign_dialog(campaign_id):
     with st.form(f"edit_campaign_modal_form_{campaign_id}", enter_to_submit=False):
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">Campaign Details</div>', unsafe_allow_html=True)
+            st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             meta_cols = st.columns(2, gap="large")
             with meta_cols[0]:
                 edit_name = st.text_input("Campaign Name *", value=str(campaign.get("name") or ""), placeholder="e.g., Q1 Marketing Campaign")
@@ -2214,6 +2227,7 @@ def show_edit_campaign_dialog(campaign_id):
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">1. Companies <small>Define the company criteria to find the right accounts.</small></div>', unsafe_allow_html=True)
+            st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             company_row1 = st.columns(3, gap="large")
             with company_row1[0]:
                 edit_industry = st.multiselect(
@@ -2248,6 +2262,7 @@ def show_edit_campaign_dialog(campaign_id):
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">2. Contacts <small>Define the contact criteria to find the right people from selected companies.</small></div>', unsafe_allow_html=True)
+            st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             contact_row1 = st.columns(2, gap="large")
             with contact_row1[0]:
                 edit_target_titles = st.multiselect(
@@ -2276,6 +2291,7 @@ def show_edit_campaign_dialog(campaign_id):
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">3. Clay Details <small>Provide Clay workbook and webhook details.</small></div>', unsafe_allow_html=True)
+            st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             st.caption("Optional: add the workbook and webhook destinations now, or save the campaign and configure them later.")
             st.caption("Build Campaign Data requires a valid workbook link and both table webhook URLs.")
             edit_clay_table_url = st.text_input(
@@ -2380,6 +2396,7 @@ def show_create_campaign_dialog():
     with st.form("create_campaign_dialog_form", enter_to_submit=False):
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">Campaign Details</div>', unsafe_allow_html=True)
+            st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             meta_cols = st.columns(2, gap="large")
             with meta_cols[0]:
                 campaign_name = st.text_input("Campaign Name *", placeholder="e.g., Q1 Marketing Campaign")
@@ -2388,6 +2405,7 @@ def show_create_campaign_dialog():
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">1. Companies <small>Define the company criteria to find the right accounts.</small></div>', unsafe_allow_html=True)
+            st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             company_row1 = st.columns(3, gap="large")
             with company_row1[0]:
                 industry = st.multiselect("Industry", options=[], default=[], accept_new_options=True, placeholder="Add or select industries", help="Each selected industry appears as a tag.")
@@ -2405,6 +2423,7 @@ def show_create_campaign_dialog():
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">2. Contacts <small>Define the contact criteria to find the right people from selected companies.</small></div>', unsafe_allow_html=True)
+            st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             contact_row1 = st.columns(2, gap="large")
             with contact_row1[0]:
                 target_titles = st.multiselect("Job Title", options=[], default=[], accept_new_options=True, placeholder="Add target job titles", help="Each selected job title appears as a tag.")
@@ -2420,6 +2439,7 @@ def show_create_campaign_dialog():
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">3. Clay Details <small>Provide Clay workbook and webhook details.</small></div>', unsafe_allow_html=True)
+            st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             st.caption("Optional: add the workbook and webhook destinations now, or save the campaign and configure them later.")
             st.caption("Build Campaign Data requires a valid workbook link and both table webhook URLs.")
             clay_table_url = st.text_input("Clay Workbook Link", placeholder="https://app.clay.com/...", help="The sales team will open this workbook to review companies and contacts.")
