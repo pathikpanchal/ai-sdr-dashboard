@@ -19,7 +19,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 APP_DIR = Path(__file__).parent
-DB_PATH = APP_DIR / "ai_sdr.db"
+# Permanent-retention contract:
+# Keep the database outside replaceable application code whenever the host supports
+# a persistent volume. Set AI_SDR_DB_PATH to that mounted path in deployment settings.
+# On Streamlit Community Cloud, local files are not a durable database guarantee;
+# use a managed PostgreSQL/Supabase database for production-grade retention.
+DB_PATH = Path(os.getenv("AI_SDR_DB_PATH", str(APP_DIR / "ai_sdr.db"))).expanduser()
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+DB_BACKUP_PATH = DB_PATH.with_suffix(DB_PATH.suffix + ".pre_update.bak")
 
 st.set_page_config(page_title="AI SDR Dashboard", page_icon="🎯", layout="wide")
 
@@ -232,8 +239,25 @@ COUNTRY_OPTIONS = [
 
 
 def get_connection():
+    # Before applying any schema changes, preserve the existing database file.
+    # SQLite's backup API creates a consistent snapshot even if WAL mode is enabled.
+    if DB_PATH.exists() and DB_PATH.stat().st_size > 0:
+        source = sqlite3.connect(DB_PATH, check_same_thread=False)
+        try:
+            backup = sqlite3.connect(DB_BACKUP_PATH)
+            try:
+                source.backup(backup)
+                backup.commit()
+            finally:
+                backup.close()
+        finally:
+            source.close()
+
     connection = sqlite3.connect(DB_PATH, check_same_thread=False)
-    # Durable app configuration: schema migrations are additive and never drop settings.
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    # Permanent-retention contract: additive migrations only. Never DROP tables,
+    # truncate records, or replace the database during an app.py deployment.
     connection.execute("CREATE TABLE IF NOT EXISTS app_settings (setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)")
     connection.execute(
         """
@@ -745,7 +769,7 @@ def on_overview_campaign_checkbox_change(campaign_id, campaign_ids):
 
 
 def get_persistent_setting(setting_key, default=""):
-    """Read a setting from the app database; safe across app.py code updates when DB is retained."""
+    """Read settings independently of app.py; retained as long as DB_PATH is durable."""
     try:
         row = conn.execute("SELECT setting_value FROM app_settings WHERE setting_key = ?", (setting_key,)).fetchone()
         return row[0] if row else default
@@ -2083,11 +2107,30 @@ def load_latest_clay_company_search(campaign_id):
     columns = [item[1] for item in conn.execute("PRAGMA table_info(clay_search_runs)").fetchall()]
     run_dict = dict(zip(columns, run))
     results = pd.read_sql_query(
-        "SELECT company_name, domain, industry, country, employee_count, company_type, location, linkedin_url, annual_revenue "
+        "SELECT company_name, domain, industry, country, employee_count, company_type, location, "
+        "description, linkedin_url, annual_revenue, raw_json "
         "FROM clay_company_results WHERE search_run_id = ? ORDER BY company_name",
         conn,
         params=(run_dict["id"],),
     )
+    # Keep every Clay company field available in the dashboard/export. The raw JSON
+    # remains the lossless source of truth; flattened columns make nested fields usable.
+    if not results.empty:
+        raw_values = results["raw_json"].fillna("").tolist()
+        flattened_rows = []
+        readable_raw = []
+        for raw_text in raw_values:
+            try:
+                payload = json.loads(raw_text) if raw_text else {}
+            except (TypeError, ValueError):
+                payload = {"unparsed_raw_payload": raw_text}
+            flattened_rows.append(_flatten_clay_payload(payload))
+            readable_raw.append(json.dumps(payload, ensure_ascii=False, indent=2))
+        flattened = pd.DataFrame(flattened_rows).add_prefix("Clay: ")
+        results = pd.concat([results.drop(columns=["raw_json"]), flattened], axis=1)
+        results["Raw Clay Data"] = readable_raw
+    else:
+        results = results.drop(columns=["raw_json"], errors="ignore")
     return run_dict, results
 
 
