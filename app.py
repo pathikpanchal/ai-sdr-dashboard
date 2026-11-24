@@ -142,76 +142,6 @@ st.markdown(
         border: 1px solid #d1d5db !important;
     }
 
-    /* Free-entry fields only: hide the select chevron SVG itself.
-       This avoids relying on BaseWeb's changing internal indicator-wrapper markup.
-       Tag close/remove icons are explicitly restored below. */
-    div.st-key-create_industry [data-baseweb="select"] svg,
-    div.st-key-create_company_city [data-baseweb="select"] svg,
-    div.st-key-create_company_state [data-baseweb="select"] svg,
-    div.st-key-create_current_cms [data-baseweb="select"] svg,
-    div.st-key-create_target_titles [data-baseweb="select"] svg,
-    div.st-key-create_department [data-baseweb="select"] svg,
-    div.st-key-edit_industry [data-baseweb="select"] svg,
-    div.st-key-edit_company_city [data-baseweb="select"] svg,
-    div.st-key-edit_company_state [data-baseweb="select"] svg,
-    div.st-key-edit_current_cms [data-baseweb="select"] svg,
-    div.st-key-edit_target_titles [data-baseweb="select"] svg,
-    div.st-key-edit_department [data-baseweb="select"] svg {
-        display: none !important;
-        visibility: hidden !important;
-        opacity: 0 !important;
-    }
-    /* Keep the × remove icon visible on selected tags in those same fields. */
-    div.st-key-create_industry [data-baseweb="tag"] svg,
-    div.st-key-create_company_city [data-baseweb="tag"] svg,
-    div.st-key-create_company_state [data-baseweb="tag"] svg,
-    div.st-key-create_current_cms [data-baseweb="tag"] svg,
-    div.st-key-create_target_titles [data-baseweb="tag"] svg,
-    div.st-key-create_department [data-baseweb="tag"] svg,
-    div.st-key-edit_industry [data-baseweb="tag"] svg,
-    div.st-key-edit_company_city [data-baseweb="tag"] svg,
-    div.st-key-edit_company_state [data-baseweb="tag"] svg,
-    div.st-key-edit_current_cms [data-baseweb="tag"] svg,
-    div.st-key-edit_target_titles [data-baseweb="tag"] svg,
-    div.st-key-edit_department [data-baseweb="tag"] svg {
-        display: inline-block !important;
-        visibility: visible !important;
-        opacity: 1 !important;
-    }
-
-    div[role="dialog"] [data-testid="stMultiSelect"] [data-baseweb="select"] span {
-        white-space: normal !important;
-    }
-    /* Dropdown indicator only for fields populated from predefined option lists. */
-    div.st-key-edit_company_size [data-testid="stMultiSelect"] [data-baseweb="select"],
-    div.st-key-edit_company_country [data-testid="stMultiSelect"] [data-baseweb="select"],
-    div.st-key-edit_seniority [data-testid="stMultiSelect"] [data-baseweb="select"],
-    div.st-key-edit_contact_country [data-testid="stMultiSelect"] [data-baseweb="select"],
-    div.st-key-create_company_size [data-testid="stMultiSelect"] [data-baseweb="select"],
-    div.st-key-create_company_country [data-testid="stMultiSelect"] [data-baseweb="select"],
-    div.st-key-create_seniority [data-testid="stMultiSelect"] [data-baseweb="select"],
-    div.st-key-create_contact_country [data-testid="stMultiSelect"] [data-baseweb="select"] {
-        position: relative !important;
-        padding-right: 1.55rem !important;
-    }
-    div.st-key-edit_company_size [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
-    div.st-key-edit_company_country [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
-    div.st-key-edit_seniority [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
-    div.st-key-edit_contact_country [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
-    div.st-key-create_company_size [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
-    div.st-key-create_company_country [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
-    div.st-key-create_seniority [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
-    div.st-key-create_contact_country [data-testid="stMultiSelect"] [data-baseweb="select"]::after {
-        content: "▾";
-        position: absolute;
-        right: 0.65rem;
-        top: 50%;
-        transform: translateY(-50%);
-        color: #111827;
-        font-size: 1rem;
-        line-height: 1;
-        pointer-events: none;
-    }
     div[role="dialog"] [data-testid="InputInstructions"],
     div[role="dialog"] [data-testid="stInputInstructions"],
     div[role="dialog"] [aria-label*="Press Enter to submit form" i],
@@ -2269,19 +2199,7 @@ def show_edit_campaign_dialog(campaign_id):
         st.error("This campaign could not be found. Close this window and refresh the dashboard.")
         return
 
-    st.caption("Update campaign details and targeting criteria. Changes to filters require criteria approval again.")
-    seniority_lookup = {value.casefold(): value for value in SENIORITY_OPTIONS}
-    saved_seniority = []
-    for value in split_clay_values(campaign.get("seniority", "")):
-        if value.casefold() == "owner / founder":
-            saved_seniority.extend(["Owner", "Founder"])
-        elif value.casefold() in seniority_lookup:
-            saved_seniority.append(seniority_lookup[value.casefold()])
-    saved_seniority = list(dict.fromkeys(saved_seniority))
-    saved_sizes = [
-        value.strip() for value in str(campaign.get("company_size", "") or "").split(",")
-        if value.strip() in COMPANY_SIZE_OPTIONS
-    ]
+    st.caption("Update campaign details and targeting criteria. All targeting filters accept free text; separate multiple values with commas. Changes to filters require criteria approval again.")
 
     with st.form(f"edit_campaign_modal_form_{campaign_id}", enter_to_submit=False):
         with st.container(border=True):
@@ -2298,72 +2216,34 @@ def show_edit_campaign_dialog(campaign_id):
             st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             company_row1 = st.columns(3, gap="large")
             with company_row1[0]:
-                edit_industry = st.multiselect(
-                    "Industry", options=[], default=split_clay_values(campaign.get("industry", "")),
-                    accept_new_options=True, placeholder="Add or select industries",
-                    help="Each selected industry appears as a tag.",
-                    key="edit_industry",
-                )
+                edit_industry = st.text_input("Industry", value=str(campaign.get("industry", "") or ""), placeholder="Enter industries, separated by commas", key="edit_industry")
             with company_row1[1]:
-                edit_company_size = st.multiselect("Company Size", COMPANY_SIZE_OPTIONS, default=saved_sizes, placeholder="Select company size", key="edit_company_size")
+                edit_company_size = st.text_input("Company Size", value=str(campaign.get("company_size", "") or ""), placeholder="Enter company sizes, separated by commas", key="edit_company_size")
             with company_row1[2]:
-                edit_company_country = st.multiselect(
-                    "Company Country", options=COUNTRY_OPTIONS, default=split_clay_values(campaign.get("company_country", "")),
-                    accept_new_options=True, placeholder="Select countries", help="Select multiple countries; each appears as a tag.",
-                    key="edit_company_country",
-                )
+                edit_company_country = st.text_input("Company Country", value=str(campaign.get("company_country", "") or ""), placeholder="Enter countries, separated by commas", key="edit_company_country")
             company_row2 = st.columns(3, gap="large")
             with company_row2[0]:
-                edit_company_city = st.multiselect(
-                    "City", options=[], default=split_clay_values(campaign.get("company_city", "")),
-                    accept_new_options=True, placeholder="Add cities", help="Optional company-headquarters location filter.",
-                    key="edit_company_city",
-                )
+                edit_company_city = st.text_input("City", value=str(campaign.get("company_city", "") or ""), placeholder="Enter cities, separated by commas", key="edit_company_city")
             with company_row2[1]:
-                edit_company_state = st.multiselect(
-                    "State / Region", options=[], default=split_clay_values(campaign.get("company_state", "")),
-                    accept_new_options=True, placeholder="Add states or regions", help="Optional company-headquarters location filter.",
-                    key="edit_company_state",
-                )
+                edit_company_state = st.text_input("State / Region", value=str(campaign.get("company_state", "") or ""), placeholder="Enter states or regions, separated by commas", key="edit_company_state")
             with company_row2[2]:
-                edit_current_cms = st.multiselect(
-                    "Current CMS", options=[], default=split_clay_values(campaign.get("current_cms", "")),
-                    accept_new_options=True, placeholder="Add CMS platforms",
-                    help="Optional research note. Each platform appears as a tag; enrichment is done in Clay after review.",
-                    key="edit_current_cms",
-                )
+                edit_current_cms = st.text_input("Current CMS", value=str(campaign.get("current_cms", "") or ""), placeholder="Enter CMS platforms, separated by commas", key="edit_current_cms")
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">2. Contacts <small>Define the contact criteria to find the right people from selected companies.</small></div>', unsafe_allow_html=True)
             st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             contact_row1 = st.columns(2, gap="large")
             with contact_row1[0]:
-                edit_target_titles = st.multiselect(
-                    "Job Title", options=[], default=split_clay_values(campaign.get("target_titles", "")),
-                    accept_new_options=True, placeholder="Add target job titles", help="Each selected job title appears as a tag.",
-                    key="edit_target_titles",
-                )
+                edit_target_titles = st.text_input("Job Title", value=str(campaign.get("target_titles", "") or ""), placeholder="Enter job titles, separated by commas", key="edit_target_titles")
             with contact_row1[1]:
-                edit_department = st.multiselect(
-                    "Department", options=[], default=split_clay_values(campaign.get("department", "")),
-                    accept_new_options=True, placeholder="Add departments", help="Each selected department appears as a tag.",
-                    key="edit_department",
-                )
+                edit_department = st.text_input("Department", value=str(campaign.get("department", "") or ""), placeholder="Enter departments, separated by commas", key="edit_department")
             contact_row2 = st.columns(3, gap="large")
             with contact_row2[0]:
-                edit_seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=saved_seniority, placeholder="Select seniority levels", key="edit_seniority")
+                edit_seniority = st.text_input("Seniority", value=str(campaign.get("seniority", "") or ""), placeholder="Enter seniority levels, separated by commas", key="edit_seniority")
             with contact_row2[1]:
-                edit_job_level = st.selectbox(
-                    "Job Level", ["Below", "Above", "Equal"],
-                    index={"below": 0, "above": 1, "exact": 2, "equal": 2}.get(str(campaign.get("job_level", "Equal") or "Equal").casefold(), 2),
-                    help="Compare the selected Seniority level(s) using this rule.",
-                )
+                edit_job_level = st.text_input("Job Level", value=str(campaign.get("job_level", "") or ""), placeholder="Enter a job-level comparison, if needed")
             with contact_row2[2]:
-                edit_contact_country = st.multiselect(
-                    "Contact Country", options=COUNTRY_OPTIONS, default=split_clay_values(campaign.get("contact_country", "")),
-                    accept_new_options=True, placeholder="Select countries", help="Each selected country appears as a tag.",
-                    key="edit_contact_country",
-                )
+                edit_contact_country = st.text_input("Contact Country", value=str(campaign.get("contact_country", "") or ""), placeholder="Enter countries, separated by commas", key="edit_contact_country")
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">3. Clay Details <small>Provide Clay workbook and webhook details.</small></div>', unsafe_allow_html=True)
@@ -2398,15 +2278,15 @@ def show_edit_campaign_dialog(campaign_id):
             owner_value = edit_owner.strip()
             original_campaign = campaign_as_dict(campaign_id) or {}
             search_criteria_fields = {
-                "industry": join_tag_values(edit_industry),
-                "company_country": join_tag_values(edit_company_country),
-                "company_state": join_tag_values(edit_company_state),
-                "company_city": join_tag_values(edit_company_city),
-                "company_size": ", ".join(edit_company_size),
-                "contact_country": join_tag_values(edit_contact_country),
-                "target_titles": join_tag_values(edit_target_titles),
-                "department": join_tag_values(edit_department),
-                "seniority": ", ".join(edit_seniority),
+                "industry": join_tag_values(split_clay_values(edit_industry)),
+                "company_country": join_tag_values(split_clay_values(edit_company_country)),
+                "company_state": join_tag_values(split_clay_values(edit_company_state)),
+                "company_city": join_tag_values(split_clay_values(edit_company_city)),
+                "company_size": join_tag_values(split_clay_values(edit_company_size)),
+                "contact_country": join_tag_values(split_clay_values(edit_contact_country)),
+                "target_titles": join_tag_values(split_clay_values(edit_target_titles)),
+                "department": join_tag_values(split_clay_values(edit_department)),
+                "seniority": join_tag_values(split_clay_values(edit_seniority)),
                 "job_level": edit_job_level,
             }
             criteria_changed = any(
@@ -2421,10 +2301,10 @@ def show_edit_campaign_dialog(campaign_id):
                        clay_companies_webhook_auth = ?, clay_contacts_webhook_auth = ?
                    WHERE id = ?""",
                 (
-                    edit_name.strip(), owner_value, join_tag_values(edit_industry), join_tag_values(edit_company_country),
-                    join_tag_values(edit_company_state), join_tag_values(edit_company_city), ", ".join(edit_company_size),
-                    join_tag_values(edit_contact_country), join_tag_values(edit_target_titles),
-                    join_tag_values(edit_current_cms), join_tag_values(edit_department), ", ".join(edit_seniority), edit_job_level,
+                    edit_name.strip(), owner_value, join_tag_values(split_clay_values(edit_industry)), join_tag_values(split_clay_values(edit_company_country)),
+                    join_tag_values(split_clay_values(edit_company_state)), join_tag_values(split_clay_values(edit_company_city)), join_tag_values(split_clay_values(edit_company_size)),
+                    join_tag_values(split_clay_values(edit_contact_country)), join_tag_values(split_clay_values(edit_target_titles)),
+                    join_tag_values(split_clay_values(edit_current_cms)), join_tag_values(split_clay_values(edit_department)), join_tag_values(split_clay_values(edit_seniority)), edit_job_level,
                     edit_clay_table_url.strip(), edit_companies_webhook.strip(), edit_contacts_webhook.strip(),
                     edit_companies_webhook_auth.strip(), edit_contacts_webhook_auth.strip(), campaign_id,
                 ),
@@ -2465,7 +2345,7 @@ def show_edit_campaign_dialog(campaign_id):
 
 @st.dialog("Create New Campaign", width="large")
 def show_create_campaign_dialog():
-    st.caption("Define your target companies and contacts to build a prospect list in Clay.")
+    st.caption("Define your target companies and contacts to build a prospect list in Clay. All targeting filters accept free text; separate multiple values with commas.")
 
     with st.form("create_campaign_dialog_form", enter_to_submit=False):
         with st.container(border=True):
@@ -2482,34 +2362,34 @@ def show_create_campaign_dialog():
             st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             company_row1 = st.columns(3, gap="large")
             with company_row1[0]:
-                industry = st.multiselect("Industry", options=[], default=[], accept_new_options=True, placeholder="Add or select industries", help="Each selected industry appears as a tag.", key="create_industry")
+                industry = st.text_input("Industry", placeholder="Enter industries, separated by commas", key="create_industry")
             with company_row1[1]:
-                company_size = st.multiselect("Company Size", COMPANY_SIZE_OPTIONS, default=[], placeholder="Select company size", key="create_company_size")
+                company_size = st.text_input("Company Size", placeholder="Enter company sizes, separated by commas", key="create_company_size")
             with company_row1[2]:
-                company_country = st.multiselect("Company Country", options=COUNTRY_OPTIONS, default=[], accept_new_options=True, placeholder="Select countries", help="Select multiple countries; each appears as a tag.", key="create_company_country")
+                company_country = st.text_input("Company Country", placeholder="Enter countries, separated by commas", key="create_company_country")
             company_row2 = st.columns(3, gap="large")
             with company_row2[0]:
-                company_city = st.multiselect("City", options=[], default=[], accept_new_options=True, placeholder="Add cities", help="Optional company-headquarters location filter.", key="create_company_city")
+                company_city = st.text_input("City", placeholder="Enter cities, separated by commas", key="create_company_city")
             with company_row2[1]:
-                company_state = st.multiselect("State / Region", options=[], default=[], accept_new_options=True, placeholder="Add states or regions", help="Optional company-headquarters location filter.", key="create_company_state")
+                company_state = st.text_input("State / Region", placeholder="Enter states or regions, separated by commas", key="create_company_state")
             with company_row2[2]:
-                current_cms = st.multiselect("Current CMS", options=[], default=[], accept_new_options=True, placeholder="Add CMS platforms", help="Optional research note. Each platform appears as a tag.", key="create_current_cms")
+                current_cms = st.text_input("Current CMS", placeholder="Enter CMS platforms, separated by commas", key="create_current_cms")
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">2. Contacts <small>Define the contact criteria to find the right people from selected companies.</small></div>', unsafe_allow_html=True)
             st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
             contact_row1 = st.columns(2, gap="large")
             with contact_row1[0]:
-                target_titles = st.multiselect("Job Title", options=[], default=[], accept_new_options=True, placeholder="Add target job titles", help="Each selected job title appears as a tag.", key="create_target_titles")
+                target_titles = st.text_input("Job Title", placeholder="Enter job titles, separated by commas", key="create_target_titles")
             with contact_row1[1]:
-                department = st.multiselect("Department", options=[], default=[], accept_new_options=True, placeholder="Add departments", help="Each selected department appears as a tag.", key="create_department")
+                department = st.text_input("Department", placeholder="Enter departments, separated by commas", key="create_department")
             contact_row2 = st.columns(3, gap="large")
             with contact_row2[0]:
-                seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=[], placeholder="Select seniority levels", key="create_seniority")
+                seniority = st.text_input("Seniority", placeholder="Enter seniority levels, separated by commas", key="create_seniority")
             with contact_row2[1]:
-                job_level = st.selectbox("Job Level", ["Below", "Above", "Equal"], index=1, help="Compare the selected Seniority level(s) using this rule.")
+                job_level = st.text_input("Job Level", placeholder="Enter a job-level comparison, if needed", key="create_job_level")
             with contact_row2[2]:
-                contact_country = st.multiselect("Contact Country", options=COUNTRY_OPTIONS, default=[], accept_new_options=True, placeholder="Select countries", help="Each selected country appears as a tag.", key="create_contact_country")
+                contact_country = st.text_input("Contact Country", placeholder="Enter countries, separated by commas", key="create_contact_country")
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">3. Clay Details <small>Provide Clay workbook and webhook details.</small></div>', unsafe_allow_html=True)
@@ -2547,11 +2427,11 @@ def show_create_campaign_dialog():
                     clay_companies_webhook_auth, clay_contacts_webhook_auth)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    campaign_id, campaign_name.strip(), join_tag_values(industry), join_tag_values(company_country),
-                    join_tag_values(company_state), join_tag_values(company_city), ", ".join(company_size),
-                    join_tag_values(contact_country), join_tag_values(target_titles),
-                    0, "Draft", datetime.now().isoformat(timespec="seconds"), join_tag_values(current_cms),
-                    join_tag_values(department), ", ".join(seniority), job_level, "", clay_table_url.strip(),
+                    campaign_id, campaign_name.strip(), join_tag_values(split_clay_values(industry)), join_tag_values(split_clay_values(company_country)),
+                    join_tag_values(split_clay_values(company_state)), join_tag_values(split_clay_values(company_city)), join_tag_values(split_clay_values(company_size)),
+                    join_tag_values(split_clay_values(contact_country)), join_tag_values(split_clay_values(target_titles)),
+                    0, "Draft", datetime.now().isoformat(timespec="seconds"), join_tag_values(split_clay_values(current_cms)),
+                    join_tag_values(split_clay_values(department)), join_tag_values(split_clay_values(seniority)), job_level, "", clay_table_url.strip(),
                     owner_value, clay_companies_webhook_url.strip(), clay_contacts_webhook_url.strip(),
                     clay_companies_webhook_auth.strip(), clay_contacts_webhook_auth.strip(),
                 ),
