@@ -144,6 +144,36 @@ st.markdown(
     div[role="dialog"] [data-testid="stMultiSelect"] [data-baseweb="select"] span {
         white-space: normal !important;
     }
+    /* Dropdown indicator only for fields populated from predefined option lists. */
+    div.st-key-edit_company_size [data-testid="stMultiSelect"] [data-baseweb="select"],
+    div.st-key-edit_company_country [data-testid="stMultiSelect"] [data-baseweb="select"],
+    div.st-key-edit_seniority [data-testid="stMultiSelect"] [data-baseweb="select"],
+    div.st-key-edit_contact_country [data-testid="stMultiSelect"] [data-baseweb="select"],
+    div.st-key-create_company_size [data-testid="stMultiSelect"] [data-baseweb="select"],
+    div.st-key-create_company_country [data-testid="stMultiSelect"] [data-baseweb="select"],
+    div.st-key-create_seniority [data-testid="stMultiSelect"] [data-baseweb="select"],
+    div.st-key-create_contact_country [data-testid="stMultiSelect"] [data-baseweb="select"] {
+        position: relative !important;
+        padding-right: 1.55rem !important;
+    }
+    div.st-key-edit_company_size [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
+    div.st-key-edit_company_country [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
+    div.st-key-edit_seniority [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
+    div.st-key-edit_contact_country [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
+    div.st-key-create_company_size [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
+    div.st-key-create_company_country [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
+    div.st-key-create_seniority [data-testid="stMultiSelect"] [data-baseweb="select"]::after,
+    div.st-key-create_contact_country [data-testid="stMultiSelect"] [data-baseweb="select"]::after {
+        content: "▾";
+        position: absolute;
+        right: 0.65rem;
+        top: 50%;
+        transform: translateY(-50%);
+        color: #111827;
+        font-size: 1rem;
+        line-height: 1;
+        pointer-events: none;
+    }
     div[role="dialog"] [data-testid="InputInstructions"],
     div[role="dialog"] [data-testid="stInputInstructions"],
     div[role="dialog"] [aria-label*="Press Enter to submit form" i],
@@ -2236,11 +2266,12 @@ def show_edit_campaign_dialog(campaign_id):
                     help="Each selected industry appears as a tag.",
                 )
             with company_row1[1]:
-                edit_company_size = st.multiselect("Company Size", COMPANY_SIZE_OPTIONS, default=saved_sizes, placeholder="Select company size")
+                edit_company_size = st.multiselect("Company Size", COMPANY_SIZE_OPTIONS, default=saved_sizes, placeholder="Select company size", key="edit_company_size")
             with company_row1[2]:
                 edit_company_country = st.multiselect(
                     "Company Country", options=COUNTRY_OPTIONS, default=split_clay_values(campaign.get("company_country", "")),
                     accept_new_options=True, placeholder="Select countries", help="Select multiple countries; each appears as a tag.",
+                    key="edit_company_country",
                 )
             company_row2 = st.columns(3, gap="large")
             with company_row2[0]:
@@ -2276,7 +2307,7 @@ def show_edit_campaign_dialog(campaign_id):
                 )
             contact_row2 = st.columns(3, gap="large")
             with contact_row2[0]:
-                edit_seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=saved_seniority, placeholder="Select seniority levels")
+                edit_seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=saved_seniority, placeholder="Select seniority levels", key="edit_seniority")
             with contact_row2[1]:
                 edit_job_level = st.selectbox(
                     "Job Level", ["Below", "Above", "Equal"],
@@ -2287,13 +2318,12 @@ def show_edit_campaign_dialog(campaign_id):
                 edit_contact_country = st.multiselect(
                     "Contact Country", options=COUNTRY_OPTIONS, default=split_clay_values(campaign.get("contact_country", "")),
                     accept_new_options=True, placeholder="Select countries", help="Each selected country appears as a tag.",
+                    key="edit_contact_country",
                 )
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">3. Clay Details <small>Provide Clay workbook and webhook details.</small></div>', unsafe_allow_html=True)
             st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
-            st.caption("Optional: add the workbook and webhook destinations now, or save the campaign and configure them later.")
-            st.caption("Build Campaign Data requires a valid workbook link and both table webhook URLs.")
             edit_clay_table_url = st.text_input(
                 "Clay Workbook Link", value=str(campaign.get("clay_table_url", "") or ""), placeholder="https://app.clay.com/...",
                 help="The sales team will open this workbook to review companies and contacts.",
@@ -2410,9 +2440,9 @@ def show_create_campaign_dialog():
             with company_row1[0]:
                 industry = st.multiselect("Industry", options=[], default=[], accept_new_options=True, placeholder="Add or select industries", help="Each selected industry appears as a tag.")
             with company_row1[1]:
-                company_size = st.multiselect("Company Size", COMPANY_SIZE_OPTIONS, default=[], placeholder="Select company size")
+                company_size = st.multiselect("Company Size", COMPANY_SIZE_OPTIONS, default=[], placeholder="Select company size", key="create_company_size")
             with company_row1[2]:
-                company_country = st.multiselect("Company Country", options=COUNTRY_OPTIONS, default=[], accept_new_options=True, placeholder="Select countries", help="Select multiple countries; each appears as a tag.")
+                company_country = st.multiselect("Company Country", options=COUNTRY_OPTIONS, default=[], accept_new_options=True, placeholder="Select countries", help="Select multiple countries; each appears as a tag.", key="create_company_country")
             company_row2 = st.columns(3, gap="large")
             with company_row2[0]:
                 company_city = st.multiselect("City", options=[], default=[], accept_new_options=True, placeholder="Add cities", help="Optional company-headquarters location filter.")
@@ -2431,17 +2461,15 @@ def show_create_campaign_dialog():
                 department = st.multiselect("Department", options=[], default=[], accept_new_options=True, placeholder="Add departments", help="Each selected department appears as a tag.")
             contact_row2 = st.columns(3, gap="large")
             with contact_row2[0]:
-                seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=[], placeholder="Select seniority levels")
+                seniority = st.multiselect("Seniority", SENIORITY_OPTIONS, default=[], placeholder="Select seniority levels", key="create_seniority")
             with contact_row2[1]:
                 job_level = st.selectbox("Job Level", ["Below", "Above", "Equal"], index=1, help="Compare the selected Seniority level(s) using this rule.")
             with contact_row2[2]:
-                contact_country = st.multiselect("Contact Country", options=COUNTRY_OPTIONS, default=[], accept_new_options=True, placeholder="Select countries", help="Each selected country appears as a tag.")
+                contact_country = st.multiselect("Contact Country", options=COUNTRY_OPTIONS, default=[], accept_new_options=True, placeholder="Select countries", help="Each selected country appears as a tag.", key="create_contact_country")
 
         with st.container(border=True):
             st.markdown('<div class="campaign-section-header">3. Clay Details <small>Provide Clay workbook and webhook details.</small></div>', unsafe_allow_html=True)
             st.markdown('<div class="campaign-section-spacer"></div>', unsafe_allow_html=True)
-            st.caption("Optional: add the workbook and webhook destinations now, or save the campaign and configure them later.")
-            st.caption("Build Campaign Data requires a valid workbook link and both table webhook URLs.")
             clay_table_url = st.text_input("Clay Workbook Link", placeholder="https://app.clay.com/...", help="The sales team will open this workbook to review companies and contacts.")
             webhook_cols = st.columns(2, gap="large")
             with webhook_cols[0]:
