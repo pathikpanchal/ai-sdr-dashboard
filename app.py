@@ -142,27 +142,39 @@ st.markdown(
         border: 1px solid #d1d5db !important;
     }
 
-    /* Free-entry fields: remove BaseWeb's native dropdown indicator only.
-       The indicator is the aria-hidden element inside the select control.
-       Scoping by widget key leaves real option dropdowns and tag remove buttons intact. */
-    .st-key-create_industry [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-create_company_city [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-create_company_state [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-create_current_cms [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-create_target_titles [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-create_department [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-edit_industry [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-edit_company_city [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-edit_company_state [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-edit_current_cms [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-edit_target_titles [data-baseweb="select"] [aria-hidden="true"],
-    .st-key-edit_department [data-baseweb="select"] [aria-hidden="true"] {
+    /* Free-entry tag fields: hide the native select chevron SVG itself.
+       The previous selectors missed the actual BaseWeb indicator in this Streamlit render.
+       Keep selected-value remove icons visible by restoring SVGs inside BaseWeb tags. */
+    .st-key-create_industry [data-baseweb="select"] svg,
+    .st-key-create_company_city [data-baseweb="select"] svg,
+    .st-key-create_company_state [data-baseweb="select"] svg,
+    .st-key-create_current_cms [data-baseweb="select"] svg,
+    .st-key-create_target_titles [data-baseweb="select"] svg,
+    .st-key-create_department [data-baseweb="select"] svg,
+    .st-key-edit_industry [data-baseweb="select"] svg,
+    .st-key-edit_company_city [data-baseweb="select"] svg,
+    .st-key-edit_company_state [data-baseweb="select"] svg,
+    .st-key-edit_current_cms [data-baseweb="select"] svg,
+    .st-key-edit_target_titles [data-baseweb="select"] svg,
+    .st-key-edit_department [data-baseweb="select"] svg {
         display: none !important;
-        width: 0 !important;
-        min-width: 0 !important;
-        padding: 0 !important;
-        margin: 0 !important;
     }
+    .st-key-create_industry [data-baseweb="tag"] svg,
+    .st-key-create_company_city [data-baseweb="tag"] svg,
+    .st-key-create_company_state [data-baseweb="tag"] svg,
+    .st-key-create_current_cms [data-baseweb="tag"] svg,
+    .st-key-create_target_titles [data-baseweb="tag"] svg,
+    .st-key-create_department [data-baseweb="tag"] svg,
+    .st-key-edit_industry [data-baseweb="tag"] svg,
+    .st-key-edit_company_city [data-baseweb="tag"] svg,
+    .st-key-edit_company_state [data-baseweb="tag"] svg,
+    .st-key-edit_current_cms [data-baseweb="tag"] svg,
+    .st-key-edit_target_titles [data-baseweb="tag"] svg,
+    .st-key-edit_department [data-baseweb="tag"] svg {
+        display: inline-block !important;
+        visibility: visible !important;
+    }
+
     div[role="dialog"] [data-testid="stMultiSelect"] [data-baseweb="select"] span {
         white-space: normal !important;
     }
