@@ -142,19 +142,20 @@ st.markdown(
         border: 1px solid #d1d5db !important;
     }
 
-    /* Hide chevrons only on free-entry tag fields; preserve tag remove icons. */
-    div[role="dialog"] .st-key-create_industry [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-create_company_city [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-create_company_state [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-create_current_cms [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-create_target_titles [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-create_department [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-edit_industry [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-edit_company_city [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-edit_company_state [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-edit_current_cms [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-edit_target_titles [data-baseweb="select"] > div:last-child svg,
-    div[role="dialog"] .st-key-edit_department [data-baseweb="select"] > div:last-child svg {
+    /* Hide chevrons on free-entry tag fields in both page and dialog layouts.
+       Do not scope this to role=dialog: the campaign form can render in the main page. */
+    .st-key-create_industry [data-baseweb="select"] > div:last-child svg,
+    .st-key-create_company_city [data-baseweb="select"] > div:last-child svg,
+    .st-key-create_company_state [data-baseweb="select"] > div:last-child svg,
+    .st-key-create_current_cms [data-baseweb="select"] > div:last-child svg,
+    .st-key-create_target_titles [data-baseweb="select"] > div:last-child svg,
+    .st-key-create_department [data-baseweb="select"] > div:last-child svg,
+    .st-key-edit_industry [data-baseweb="select"] > div:last-child svg,
+    .st-key-edit_company_city [data-baseweb="select"] > div:last-child svg,
+    .st-key-edit_company_state [data-baseweb="select"] > div:last-child svg,
+    .st-key-edit_current_cms [data-baseweb="select"] > div:last-child svg,
+    .st-key-edit_target_titles [data-baseweb="select"] > div:last-child svg,
+    .st-key-edit_department [data-baseweb="select"] > div:last-child svg {
         display: none !important;
     }
     div[role="dialog"] [data-testid="stMultiSelect"] [data-baseweb="select"] span {
