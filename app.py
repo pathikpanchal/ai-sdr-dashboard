@@ -233,6 +233,8 @@ COUNTRY_OPTIONS = [
 
 def get_connection():
     connection = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Durable app configuration: schema migrations are additive and never drop settings.
+    connection.execute("CREATE TABLE IF NOT EXISTS app_settings (setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS campaigns (
@@ -742,11 +744,48 @@ def on_overview_campaign_checkbox_change(campaign_id, campaign_ids):
     st.session_state["editing_campaign_id"] = None
 
 
+def get_persistent_setting(setting_key, default=""):
+    """Read a setting from the app database; safe across app.py code updates when DB is retained."""
+    try:
+        row = conn.execute("SELECT setting_value FROM app_settings WHERE setting_key = ?", (setting_key,)).fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+
+def save_persistent_setting(setting_key, setting_value):
+    """Upsert one setting without modifying or replacing any other app data."""
+    conn.execute(
+        "INSERT INTO app_settings(setting_key, setting_value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at",
+        (setting_key, str(setting_value), datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+
+
+def _flatten_clay_payload(value, prefix="", output=None):
+    """Flatten nested Clay JSON for table/export columns while retaining original JSON separately."""
+    if output is None:
+        output = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_key = f"{prefix}.{key}" if prefix else str(key)
+            _flatten_clay_payload(child, child_key, output)
+    elif isinstance(value, list):
+        output[prefix or "value"] = json.dumps(value, ensure_ascii=False)
+    else:
+        output[prefix or "value"] = "" if value is None else value
+    return output
+
+
 def get_clay_api_key():
     """Return the dashboard-entered Clay key, then fall back to deployment secrets."""
     session_value = str(st.session_state.get("clay_api_key_override", "") or "").strip()
     if session_value:
         return session_value
+    persisted_value = str(get_persistent_setting("clay_api_key", "") or "").strip()
+    if persisted_value:
+        return persisted_value
     secret_value = ""
     try:
         clay_secrets = st.secrets.get("clay", {})
@@ -764,6 +803,9 @@ def get_clay_search_result_cap():
 
 def _get_clay_record_limit(session_key, secret_key):
     configured = st.session_state.get(session_key, None)
+    if configured is None:
+        persisted_key = "max_companies_per_search" if secret_key == "max_companies_per_search" else "max_contacts_per_search"
+        configured = get_persistent_setting(persisted_key, None)
     if configured is None:
         try:
             clay_secrets = st.secrets.get("clay", {})
@@ -1139,37 +1181,52 @@ def run_clay_company_search(campaign, campaign_id, api_key):
         size_field = schema.get("sizes") or schema.get("company_sizes") or schema.get("company_size")
         if not size_field:
             raise RuntimeError("Clay's live company-search schema does not expose a company size filter.")
-        # Accept the dashboard's exact display labels plus common shorthand ranges.
-        # Clay's Public API uses bucket boundary codes, so 51-500 spans two buckets.
-        company_size_aliases = {
-            "51-500": ["51-200 employees", "201-500 employees"],
-            "51-500 employees": ["51-200 employees", "201-500 employees"],
-            "501-1000": ["501-1,000 employees"],
-            "501-1000 employees": ["501-1,000 employees"],
-            "1001-5000": ["1,001-5,000 employees"],
-            "1001-5000 employees": ["1,001-5,000 employees"],
-            "5001-10000": ["5,001-10,000 employees"],
-            "5001-10000 employees": ["5,001-10,000 employees"],
-            "10000+": ["10,001+ employees"],
-            "10000+ employees": ["10,001+ employees"],
-        }
+        # Normalize common employee-size inputs to Clay's canonical buckets.
+        # This accepts dashboard labels, shorthand ranges, commas, spaces and
+        # different dash characters (e.g. 500-1000, 501–1,000 employees).
+        def normalize_company_size_label(raw_label):
+            value = str(raw_label or "").strip().lower()
+            value = value.replace("–", "-").replace("—", "-").replace("−", "-")
+            value = value.replace(",", "")
+            value = re.sub(r"\s+", "", value)
+            value = value.replace("employees", "").replace("employee", "")
+            range_match = re.fullmatch(r"(\d+)-(\d+)", value)
+            if range_match:
+                lower, upper = map(int, range_match.groups())
+                if lower in (500, 501) and upper == 1000:
+                    return "501-1,000 employees"
+                if lower in (1000, 1001) and upper == 5000:
+                    return "1,001-5,000 employees"
+                if lower in (5000, 5001) and upper == 10000:
+                    return "5,001-10,000 employees"
+                if lower == 51 and upper == 500:
+                    return ["51-200 employees", "201-500 employees"]
+                if lower == 2 and upper == 10:
+                    return "2-10 employees"
+                if lower == 11 and upper == 50:
+                    return "11-50 employees"
+                if lower == 51 and upper == 200:
+                    return "51-200 employees"
+                if lower == 201 and upper == 500:
+                    return "201-500 employees"
+            if value in ("10000+", "10001+"):
+                return "10,001+ employees"
+            return raw_label
+
         expanded_size_labels = []
-        for label in company_size_labels:
-            normalized_label = re.sub(r"\\s+", " ", str(label).strip().lower())
-            normalized_label = normalized_label.replace("–", "-").replace("—", "-")
-            normalized_label = normalized_label.replace(",", "")
-            alias_target = company_size_aliases.get(normalized_label)
-            if alias_target:
-                expanded_size_labels.extend(alias_target)
+        for raw_label in company_size_labels:
+            normalized = normalize_company_size_label(raw_label)
+            if isinstance(normalized, list):
+                expanded_size_labels.extend(normalized)
             else:
-                expanded_size_labels.append(label)
+                expanded_size_labels.append(normalized)
 
         unknown_size_labels = [
             label for label in expanded_size_labels
             if label not in COMPANY_SIZE_CLAY_VALUES
         ]
         if unknown_size_labels:
-            raise ValueError("Unsupported Company Size option(s): " + ", ".join(unknown_size_labels))
+            raise ValueError("Unsupported Company Size option(s): " + ", ".join(map(str, unknown_size_labels)))
         # Clay's `sizes` filter expects bucket codes, not display labels.
         company_size_codes = list(dict.fromkeys(
             COMPANY_SIZE_CLAY_VALUES[label] for label in expanded_size_labels
@@ -1955,11 +2012,31 @@ def load_latest_clay_people_search(campaign_id):
     ))
     results = pd.read_sql_query(
         "SELECT full_name, first_name, last_name, job_title, seniority, department, location, "
-        "location_country, company_name, company_domain, company_linkedin_url, linkedin_url "
+        "location_country, company_name, company_domain, company_linkedin_url, linkedin_url, raw_json "
         "FROM clay_people_results WHERE search_run_id = ? ORDER BY full_name",
         conn,
         params=(run_dict["id"],),
     )
+    # Add every Clay-returned field (including nested values) as a separate column.
+    # raw_json remains intact as the lossless source of truth.
+    if not results.empty:
+        flattened_rows = []
+        for raw_text in results["raw_json"].fillna(""):
+            try:
+                payload = json.loads(raw_text) if raw_text else {}
+            except (TypeError, ValueError):
+                payload = {"unparsed_raw_payload": raw_text}
+            flattened_rows.append(_flatten_clay_payload(payload))
+        raw_frame = pd.DataFrame(flattened_rows).add_prefix("Clay: ")
+        results = pd.concat([results.drop(columns=["raw_json"]), raw_frame], axis=1)
+        # Include a readable full JSON column as well, so no original payload is lost.
+        results["Raw Clay Data"] = [
+            json.dumps(json.loads(value), ensure_ascii=False, indent=2) if value else "{}"
+            for value in pd.read_sql_query(
+                "SELECT raw_json FROM clay_people_results WHERE search_run_id = ? ORDER BY full_name",
+                conn, params=(run_dict["id"],)
+            )["raw_json"].fillna("")
+        ]
     return run_dict, results
 
 
@@ -3088,6 +3165,13 @@ if active_page == "Campaigns":
                             "Company LinkedIn URL": st.column_config.LinkColumn("Company LinkedIn URL", display_text="Company LinkedIn"),
                         },
                     )
+                    st.download_button(
+                        "Download All Contact Data (CSV)",
+                        data=latest_people_results.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"clay_contacts_{selected_id}.csv",
+                        mime="text/csv",
+                        key=f"download_all_clay_contacts_{selected_id}",
+                    )
                     with st.expander("Clay contact search query sent"):
                         st.code(latest_people_run["query_text"], language="sql")
                     debug_text = latest_people_run.get("debug_json", "")
@@ -3586,9 +3670,10 @@ elif active_page == "Settings":
             save_key = st.form_submit_button("Save API Key", type="primary")
         if save_key:
             if entered_key.strip():
+                save_persistent_setting("clay_api_key", entered_key.strip())
                 st.session_state["clay_api_key_override"] = entered_key.strip()
                 st.session_state["clay_api_connection_status"] = "Not tested"
-                st.success("Clay API key saved for this active app session.")
+                st.success("Clay API key saved in the dashboard database. It will remain available when app.py is updated, provided the database file is retained.")
                 st.rerun()
             else:
                 st.warning("Enter an API key before saving.")
@@ -3652,7 +3737,9 @@ elif active_page == "Settings":
         if st.button("Save Record Limits", key="save_clay_record_limits"):
             st.session_state["clay_company_limit"] = int(company_limit)
             st.session_state["clay_contact_limit"] = int(contact_limit)
-            st.success("Record limits saved for this active app session.")
+            save_persistent_setting("max_companies_per_search", int(company_limit))
+            save_persistent_setting("max_contacts_per_search", int(contact_limit))
+            st.success("Record limits saved in the dashboard database and will be retained across app.py updates when the database file is retained.")
             st.rerun()
         st.info(
             "Clay enforces limits based on your workspace plan. Selecting 100 or 150 here "
