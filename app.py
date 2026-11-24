@@ -1540,20 +1540,41 @@ def build_clay_people_filters(campaign, company_identifiers, people_schema):
             field, seniority_values, "Seniority / Job Level"
         )
 
-    department_values = [
-        value for value in split_clay_values(campaign.get("department", ""))
-        if value.casefold() not in ("any", "all")
-    ]
-    if department_values:
-        field = people_schema.get("job_functions")
-        if not field:
-            raise RuntimeError(
-                "Clay's current people-search schema does not expose job_functions, "
-                "so the requested Department filter cannot be safely applied."
-            )
-        filters["job_functions"] = _clay_filter_values(field, department_values, "Department")
-
+    # Clay's current public people-search schema does not expose a Department
+    # filter. Department is therefore applied locally after parsing each returned
+    # profile; never send an unsupported job_functions field to Clay.
     return filters
+
+
+def _person_matches_department(person, requested_departments):
+    """Best-effort local department matching using Clay's explicit/inferred value and title."""
+    requested = [str(value).strip().casefold() for value in requested_departments if str(value).strip()]
+    if not requested or any(value in ("any", "all") for value in requested):
+        return True
+    observed = " ".join([
+        str(person.get("department", "") or ""),
+        str(person.get("job_title", "") or ""),
+    ]).casefold()
+    aliases = {
+        "hr": ("human resources", "recruiting", "talent acquisition", "people operations"),
+        "people": ("human resources", "recruiting", "talent acquisition", "people operations"),
+        "talent": ("human resources", "recruiting", "talent acquisition", "people operations"),
+        "sales": ("sales", "business development", "account executive", "account management"),
+        "biz dev": ("business development", "sales"), "bd": ("business development", "sales"),
+        "marketing": ("marketing", "brand", "communications", "growth", "demand generation"),
+        "it": ("information technology", "technical support"),
+        "tech": ("technology", "engineering", "software", "developer", "technical"),
+        "pr": ("communications", "public relations"), "comms": ("communications", "public relations"),
+    }
+    for value in requested:
+        normalized_values = aliases.get(value, (value,))
+        if any(term and term in observed for term in normalized_values):
+            return True
+        # If the parser inferred a canonical department, allow common variants.
+        canonical = str(person.get("department", "") or "").casefold()
+        if canonical and any(canonical == term or term in canonical or canonical in term for term in normalized_values):
+            return True
+    return False
 
 
 def _first_nonempty(mapping, *keys):
@@ -1837,12 +1858,20 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
         }
 
         rows, rejected_employer_count, unverified_employer_count = [], 0, 0
+        department_rejected_count = 0
+        requested_departments = [
+            value for value in split_clay_values(campaign.get("department", ""))
+            if value.casefold() not in ("any", "all")
+        ]
         profiles_with_title = 0
         profiles_with_current_experience = 0
         for raw_row in raw_rows:
             person = _parse_clay_person_row(raw_row)
             profiles_with_title += int(bool(person["job_title"]))
             profiles_with_current_experience += int(person["has_current_experience"])
+            if requested_departments and not _person_matches_department(person, requested_departments):
+                department_rejected_count += 1
+                continue
             current_ids = {
                 _normalize_company_match_identifier(person["company_linkedin_url"]),
                 _normalize_company_match_identifier(person["company_domain"]),
@@ -1864,6 +1893,9 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
             "retained_profile_count": len(rows),
             "employer_mismatch_rejected_count": rejected_employer_count,
             "retained_without_employer_identifier_count": unverified_employer_count,
+            "department_filter_mode": "local best-effort match on parsed department and job title" if requested_departments else "not selected",
+            "department_filter_values": requested_departments,
+            "department_rejected_count": department_rejected_count,
             "profiles_with_parsed_title_count": profiles_with_title,
             "profiles_with_current_experience_count": profiles_with_current_experience,
             "title_filtering": "Applied by Clay Search API; no second strict substring filter applied locally.",
@@ -1871,6 +1903,7 @@ def run_clay_people_search(campaign, campaign_id, api_key, company_identifiers, 
         summary = (
             f"Clay returned {len(raw_rows)} profiles across {page_count} page(s); retained {len(rows)}; "
             f"excluded {rejected_employer_count} with a conflicting employer; "
+            f"excluded {department_rejected_count} outside the locally matched department filter; "
             f"retained {unverified_employer_count} without employer identifiers under the company-scoped search."
         )
         conn.execute(
